@@ -178,39 +178,67 @@ void setup_paging() {
 // ЗАЩИТНЫЕ ФЛАГИ ПРОЦЕССОРА
 // ===================================
 
+static inline void cpuid(uint32_t leaf, uint32_t subleaf,
+    uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx) {
+    __asm__ volatile (
+        "cpuid"
+        : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx)
+        : "a"(leaf), "c"(subleaf)
+    );
+}
+
 void enable_cpu_protections() {
     uint64_t cr3, cr4;
-    
+    uint32_t eax, ebx, ecx, edx;
+    int has_smep = 0;
+    int has_smap = 0;
+
     // Загружаем CR3 с таблицей страниц
     __asm__ volatile ("mov %0, %%cr3" : : "r"((uint64_t)pml4));
-    
-    // Читаем CR4 и устанавливаем защитные флаги
+
+    // Читаем CR4 и устанавливаем обязательные флаги
     __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
-    
-    cr4 |= (1 << 5);  // PAE - Physical Address Extension
-    cr4 |= (1 << 7);  // PGE - Page Global Enable
-    cr4 |= (1 << 18); // SMEP - Supervisor Mode Execution Prevention
-    cr4 |= (1 << 19); // SMAP - Supervisor Mode Access Prevention
-    cr4 |= (1 << 20); // SMXE - SMX Enable (если поддерживается)
-    
+
+    cr4 |= (1ULL << 5);  // PAE - Physical Address Extension
+    cr4 |= (1ULL << 7);  // PGE - Page Global Enable
+
+    // Проверяем поддержку SMEP/SMAP через CPUID. Если не поддерживается, оставляем флаги выключенными.
+    cpuid(0, 0, &eax, &ebx, &ecx, &edx);
+    if (eax >= 7) {
+        cpuid(7, 0, &eax, &ebx, &ecx, &edx);
+        has_smep = (ebx & (1u << 7)) != 0;
+        has_smap = (ebx & (1u << 8)) != 0;
+    }
+
+    if (has_smep) {
+        cr4 |= (1ULL << 18);  // SMEP
+    } else {
+        cr4 &= ~(1ULL << 18);
+    }
+
+    if (has_smap) {
+        cr4 |= (1ULL << 19);  // SMAP
+    } else {
+        cr4 &= ~(1ULL << 19);
+    }
+
     __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4));
-    
+
     // Читаем CR0 и включаем paging + NX
     uint64_t cr0;
     __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
-    
+
     cr0 |= (1ULL << 31);  // PG - Paging enable
     cr0 |= (1ULL << 0);   // PE - Protection enable
     cr0 &= ~(1ULL << 2);  // EM - Floating point, disable
     cr0 |= (1ULL << 3);   // TS - Task switched (переключение контекста)
-    
+
     __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0));
-    
+
     // Включаем NX-бит в EFER
-    uint32_t eax, edx;
     __asm__ volatile ("rdmsr" : "=a"(eax), "=d"(edx) : "c"(0xC0000080));
-    eax |= (1 << 11);  // NX Enable
-    eax |= (1 << 8);   // LME - Long Mode Enable
+    eax |= (1u << 11);  // NX Enable
+    eax |= (1u << 8);   // LME - Long Mode Enable
     __asm__ volatile ("wrmsr" : : "a"(eax), "d"(edx), "c"(0xC0000080));
 }
 
@@ -463,40 +491,5 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
         __asm__ volatile ("hlt");
     }
     
-    return EFI_SUCCESS;
-}
-        uefi_call_wrapper(KernelFile->Read, 3,
-            KernelFile, &fileSize, (void*)addr);
-
-        // обнуляем bss
-        if (phdrs[i].p_memsz > phdrs[i].p_filesz) {
-            SetMem((void*)(addr + phdrs[i].p_filesz),
-                   phdrs[i].p_memsz - phdrs[i].p_filesz, 0);
-        }
-    }
-
-    // Выходим из Boot Services
-    UINTN mapSize = 0, mapKey, descSize;
-    UINT32 descVersion;
-
-    SystemTable->BootServices->GetMemoryMap(
-        &mapSize, NULL, &mapKey, &descSize, &descVersion);
-
-    mapSize += descSize * 2;
-
-    EFI_MEMORY_DESCRIPTOR *map;
-    uefi_call_wrapper(SystemTable->BootServices->AllocatePool,
-        3, EfiLoaderData, mapSize, (void**)&map);
-
-    uefi_call_wrapper(SystemTable->BootServices->GetMemoryMap,
-        5, &mapSize, map, &mapKey, &descSize, &descVersion);
-
-    uefi_call_wrapper(SystemTable->BootServices->ExitBootServices,
-        2, ImageHandle, mapKey);
-
-    // Прыжок в ядро
-    void (*kernel_entry)() = (void(*)())header.e_entry;
-    kernel_entry();
-
     return EFI_SUCCESS;
 }

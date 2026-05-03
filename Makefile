@@ -11,18 +11,26 @@ ASFLAGS = -f elf64
 LD = ld
 LDFLAGS = -n
 
-TARGETS = bootloader.o \
-          kernel_main.o \
-          context_switch.o \
-          memory.o \
-          ipc.o
+KERNEL_OBJS = kernel_main.o \
+              context_switch.o \
+              memory.o \
+              ipc.o \
+              disk.o \
+              ext4.o \
+              graphics.o
 
-all: kernel.elf kernel.iso
+BOOTLOADER_OBJ = bootloader.o
+
+all: bootloader.efi kernel.elf kernel.iso
 
 # Bootloader (UEFI x64)
 bootloader.o: bootloader.c
 	@echo "[CC] Building bootloader..."
 	$(CC) $(CCFLAGS) -DUEFI -c $< -o $@
+
+bootloader.efi: $(BOOTLOADER_OBJ)
+	@echo "[LD] Linking UEFI bootloader..."
+	$(LD) -nostdlib -shared -Bsymbolic -e efi_main --oformat=pei-x86-64 -o $@ $^
 
 # Kernel main
 kernel_main.o: Kernel/Main/main.c
@@ -39,27 +47,41 @@ memory.o: Kernel/Memory/MemoryControl.c
 	@echo "[CC] Building memory manager..."
 	$(CC) $(CCFLAGS) -mcmodel=kernel -c $< -o $@
 
+# Disk subsystem
+disk.o: Kernel/Drivers/disk.c
+	@echo "[CC] Building disk subsystem..."
+	$(CC) $(CCFLAGS) -mcmodel=kernel -c $< -o $@
+
+# EXT4 filesystem
+ext4.o: Kernel/Drivers/ext4.c
+	@echo "[CC] Building ext4 filesystem..."
+	$(CC) $(CCFLAGS) -mcmodel=kernel -c $< -o $@
+
+# Graphics driver
+graphics.o: Kernel/Drivers/graphics.c
+	@echo "[CC] Building graphics driver..."
+	$(CC) $(CCFLAGS) -mcmodel=kernel -c $< -o $@
+
 # IPC system
 ipc.o: Kernel/Main/main.c
 	@echo "[CC] Building IPC system..."
 	$(CC) $(CCFLAGS) -mcmodel=kernel -DIPC_ONLY -c $< -o $@
 
 # Link kernel ELF
-kernel.elf: $(TARGETS)
+kernel.elf: $(KERNEL_OBJS)
 	@echo "[LD] Linking kernel..."
-	$(LD) $(LDFLAGS) -T linker.ld $(TARGETS) -o $@
+	$(LD) $(LDFLAGS) -T linker.ld $(KERNEL_OBJS) -o $@
 	@echo "[INFO] Kernel image: $@"
 
 # Create ISO image
-kernel.iso: kernel.elf
+kernel.iso: bootloader.efi kernel.elf
 	@echo "[BUILD] Creating ISO image..."
 	@mkdir -p iso/EFI/BOOT
 	@mkdir -p iso/Kernel/Main
 	@cp bootloader.efi iso/EFI/BOOT/BOOTX64.EFI
 	@cp kernel.elf iso/Kernel/Main/kernel.elf
-	@mkisofs -R -J -b boot.img -no-emul-boot \
-	         -boot-load-size 4 -input-charset utf-8 \
-	         -o kernel.iso iso/
+	@mkisofs -R -J -iso-level 3 -no-emul-boot -eltorito-alt-boot \
+	         -e EFI/BOOT/BOOTX64.EFI -o kernel.iso iso/
 
 # Debugging info
 objdump: kernel.elf
@@ -73,7 +95,7 @@ symbols: kernel.elf
 # Cleanup
 clean:
 	@echo "[CLEAN] Removing build artifacts..."
-	rm -f *.o *.elf *.iso
+	rm -f *.o *.elf *.efi *.iso
 	rm -rf iso/
 
 mrclean: clean
