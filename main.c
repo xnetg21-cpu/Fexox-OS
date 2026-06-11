@@ -8,6 +8,7 @@ extern "C" {
 #include <stdint.h>
 #include "debug_out.h"
 #include "Scheduler.h"
+#include "VFS.h"
 
 typedef struct __attribute__((packed)) {
     uint64_t magic;
@@ -284,7 +285,58 @@ void kernel_entry(BOOT_INFO *info) {
     kprint("[OK] usermode\n");
     DBG_MSG("KR", "17 usermode ok");
 
-    /* --- Планировщик --- */
+    /*
+     * VFS + virtio ДО планировщика: legacy virtio-blk в QEMU обрабатывает
+     * queue notify асинхронно (BH). Нужны IF=1 и отсутствие вытеснения,
+     * иначе poll зависает (used->idx не обновляется).
+     */
+    __asm__ volatile ("sti" ::: "memory");
+    DBG_MSG("KR", "20 vfs_init...");
+    ret = vfs_init();
+    if (ret != 0) {
+        kprint_err("[WARN] vfs_init", ret);
+    } else {
+        kprint("[OK] vfs\n");
+        DBG_MSG("KR", "21 virtio_blk_init...");
+        ret = virtio_blk_init();
+        if (ret != 0) {
+            kprint_err("[WARN] virtio_blk_init", ret);
+        } else {
+            kprint("[OK] virtio-blk (vda)\n");
+            fat32_register();
+            ret = vfs_mount("vda", "fat32", "/", 0);
+            if (ret != 0) {
+                kprint_err("[WARN] vfs_mount /", ret);
+            } else {
+                kprint("[OK] / mounted (FAT32)\n");
+                /* Тест: создать файл */
+                int fd = vfs_open("/hello.txt", O_RDWR | O_CREAT);
+                if (fd >= 0) {
+                    const char *msg = "Hello from FEXOS!\n";
+                    vfs_write(fd, msg, 18);
+                    vfs_seek(fd, 0, 0);
+                    char rbuf[64];
+                    int64_t n = vfs_read(fd, rbuf, 63);
+                    if (n > 0) { rbuf[n] = 0; kprint(rbuf); }
+                    vfs_close(fd);
+                    kprint("[OK] VFS r/w test\n");
+                }
+                /* readdir / */
+                int dfd = vfs_open("/", O_DIRECTORY);
+                if (dfd >= 0) {
+                    vfs_dirent_t de;
+                    kprint("[LS /]\n");
+                    for (uint32_t i = 0; vfs_readdir(dfd, i, &de) == VFS_OK; i++) {
+                        kprint("  "); kprint(de.name);
+                        kprint(de.type == VFS_TYPE_DIR ? "/\n" : "\n");
+                    }
+                    vfs_close(dfd);
+                }
+            }
+        }
+    }
+
+    /* --- Планировщик (после mount — blk I/O уже не нужен на boot path) --- */
     DBG_MSG("KR", "18 sched_init...");
     ret = sched_init();
     if (ret != 0) {
@@ -294,9 +346,8 @@ void kernel_entry(BOOT_INFO *info) {
     kprint("[OK] scheduler\n");
     DBG_MSG("KR", "19 sched ok");
 
-    /* --- Тестовые потоки --- */
     sched_create_kthread(worker_a, NULL, "worker_a",  0);
-    sched_create_kthread(worker_b, NULL, "worker_b", -5);  /* немного важнее */
+    sched_create_kthread(worker_b, NULL, "worker_b", -5);
     kprint("[OK] kthreads\n");
 
     /* --- Запускаем --- */

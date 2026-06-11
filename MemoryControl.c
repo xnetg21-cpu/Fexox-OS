@@ -195,6 +195,50 @@ phys_addr_t pmm_alloc_frames(size_t count, size_t align) {
 }
 phys_addr_t pmm_alloc_frame(void) { return pmm_alloc_frames(1, 1); }
 
+/*
+ * pmm_alloc_frames_above — выделить count физически непрерывных фреймов,
+ * все из которых >= min_phys. Используется для DMA-буферов которые не должны
+ * попадать в conventional memory (0–1MB), где QEMU/OVMF/BIOS имеют свои
+ * структуры и QEMU может не иметь доступа к этим физическим адресам.
+ *
+ * min_phys: минимальный физический адрес (обычно 0x100000 = 1MB).
+ */
+phys_addr_t pmm_alloc_frames_above(size_t count, size_t align, phys_addr_t min_phys) {
+    if (count == 0 || (align & (align - 1)) != 0) return (phys_addr_t)-1;
+    /* Минимальный фрейм (округляем вверх) */
+    size_t min_frame = (size_t)((min_phys + PAGE_SIZE - 1) >> PAGE_SHIFT);
+    /* align должен быть степенью двойки и >= 1 */
+    size_t a = align ? align : 1;
+
+    spinlock_acquire(&g_pmm.lock);
+    size_t limit = g_pmm.total_frames;
+    size_t idx = min_frame;
+    phys_addr_t result = (phys_addr_t)-1;
+
+    while (idx + count <= limit) {
+        size_t cand = pmm_find_next_zero(idx, limit);
+        if (cand == (size_t)-1) break;
+        /* Выравниваем кандидата */
+        size_t aligned = (cand + a - 1) & ~(a - 1);
+        /* Не опускаемся ниже min_frame */
+        if (aligned < min_frame) aligned = (min_frame + a - 1) & ~(a - 1);
+        if (aligned + count > limit) break;
+        bool ok = true;
+        for (size_t i = 0; i < count; i++) {
+            if (pmm_test(aligned + i)) { ok = false; break; }
+        }
+        if (ok) {
+            for (size_t i = 0; i < count; i++) pmm_set(aligned + i);
+            g_pmm.free_frames -= count;
+            result = (phys_addr_t)aligned << PAGE_SHIFT;
+            break;
+        }
+        idx = aligned + count;
+    }
+    spinlock_release(&g_pmm.lock);
+    return result;
+}
+
 void pmm_free_frames(phys_addr_t pa, size_t count) {
     if (pa == 0 || pa == (phys_addr_t)-1 || count == 0) return;
     size_t idx = pa >> PAGE_SHIFT;

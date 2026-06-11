@@ -24,7 +24,10 @@ $CC $CFLAGS_KERN -c main.c -o build/main.o
 $CC $CFLAGS_KERN -c MemoryControl.c -o build/MemoryControl.o
 $CC $CFLAGS_KERN -c InterruptControl.c -o build/InterruptControl.o
 $CC $CFLAGS_KERN -c Scheduler.c -o build/Scheduler.o
-$LD_KERN $LDFLAGS_KERN -o build/kernel.bin build/boot_stub.o build/main.o build/MemoryControl.o build/InterruptControl.o build/Scheduler.o
+$CC $CFLAGS_KERN -c VFS.c      -o build/VFS.o
+$CC $CFLAGS_KERN -c FAT32.c    -o build/FAT32.o
+$CC $CFLAGS_KERN -c klibc.c    -o build/klibc.o
+$LD_KERN $LDFLAGS_KERN -o build/kernel.bin build/boot_stub.o build/main.o build/MemoryControl.o build/InterruptControl.o build/Scheduler.o build/VFS.o build/FAT32.o build/klibc.o
 
 echo "[*] Загрузчик UEFI..."
 $MGW $CFLAGS_BOOT -c bootloader.c -o build/bootloader.o
@@ -53,9 +56,16 @@ if command -v mformat >/dev/null; then
     echo "\\EFI\\BOOT\\BOOTX64.EFI" >> build/startup.nsh
     mcopy -i build/esp.img build/startup.nsh ::startup.nsh
     echo "[OK] startup.nsh успешно добавлен в образ esp.img"
+
+    # data.img — отдельный чистый FAT32 диск для virtio-blk.
+    # Ядро монтирует именно его; esp.img используется только для загрузки UEFI.
+    echo "[*] Диск build/data.img (virtio-blk data disk)..."
+    dd if=/dev/zero of=build/data.img bs=1M count=64 status=none
+    mformat -i build/data.img -F -v FEXDATA ::
+    echo "[OK] build/data.img готов"
 else
     echo "[!] mtools нет — pacman -S mingw-w64-ucrt-x86_64-mtools"
 fi
 
-echo "[+] build/kernel.bin  build/bootloader.efi  C:\\fos"
+echo "[+] build/kernel.bin  build/bootloader.efi  build/esp.img  build/data.img"
 echo "=== Готово ==="
