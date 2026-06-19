@@ -1,6 +1,7 @@
 /* boot_stub.c — точка входа ядра (higher-half) */
 #include <stdint.h>
 #include "debug_out.h"
+#include "Framebuffer.h"
 
 typedef struct __attribute__((packed)) {
     uint64_t magic;
@@ -12,6 +13,7 @@ typedef struct __attribute__((packed)) {
     uint64_t pml4_phys;
     void    *gdt_ptr;
     void    *idt_ptr;
+    fb_info_t fb;
 } BOOT_INFO;
 
 extern void kernel_entry(BOOT_INFO *info);

@@ -56,6 +56,66 @@ static EFI_GUID EFI_FILE_INFO_ID =
     {0x09576e92, 0x6d3f, 0x11d2, {0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}};
 static EFI_GUID EFI_LOADED_IMAGE_PROTOCOL_GUID =
     {0x5B1B31A1, 0x9562, 0x11d2, {0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B}};
+static EFI_GUID EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID =
+    {0x9042a9de, 0x23dc, 0x4a38, {0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a}};
+
+/* ---- GOP (Graphics Output Protocol) ---- */
+typedef enum {
+    PixelRedGreenBlueReserved8BitPerColor,
+    PixelBlueGreenRedReserved8BitPerColor,
+    PixelBitMask,
+    PixelBltOnly,
+    PixelFormatMax
+} EFI_GRAPHICS_PIXEL_FORMAT;
+
+typedef struct {
+    UINT32 RedMask;
+    UINT32 GreenMask;
+    UINT32 BlueMask;
+    UINT32 ReservedMask;
+} EFI_PIXEL_BITMASK;
+
+typedef struct {
+    UINT32                    Version;
+    UINT32                    HorizontalResolution;
+    UINT32                    VerticalResolution;
+    EFI_GRAPHICS_PIXEL_FORMAT PixelFormat;
+    EFI_PIXEL_BITMASK         PixelInformation;
+    UINT32                    PixelsPerScanLine;
+} EFI_GRAPHICS_OUTPUT_MODE_INFORMATION;
+
+typedef struct {
+    UINT32                             MaxMode;
+    UINT32                             Mode;
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *Info;
+    UINTN                              SizeOfInfo;
+    EFI_PHYSICAL_ADDRESS               FrameBufferBase;
+    UINTN                              FrameBufferSize;
+} EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE;
+
+typedef struct {
+    void *QueryMode;
+    void *SetMode;
+    void *Blt;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *Mode;
+} EFI_GRAPHICS_OUTPUT_PROTOCOL;
+
+/* ---- fb_info_t (должна совпадать с Framebuffer.h) ---- */
+#define FB_MODE_NONE    0
+#define FB_MODE_VGA     1
+#define FB_MODE_LINEAR  2
+
+typedef struct {
+    UINT8  mode;
+    UINT32 width;
+    UINT32 height;
+    UINT32 pitch;
+    UINT8  bpp;
+    UINT64 phys_addr;
+    UINT32 red_mask;
+    UINT32 green_mask;
+    UINT32 blue_mask;
+} fb_info_t;
 
 typedef struct {
     UINT64 Revision;
@@ -184,6 +244,7 @@ typedef struct PACKED {
     UINT64  pml4_phys;
     void    *gdt_ptr;
     void    *idt_ptr;
+    fb_info_t fb;
 } BOOT_INFO;
 
 #define BOOT_INFO_MAGIC 0x4B45524E454C424FULL
@@ -458,6 +519,56 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     DBG_MSG("BL", "08 paging built");
 
     /* ==========================================================
+     * GOP — получаем framebuffer ДО ExitBootServices.
+     * После EBS обращаться к Boot Services нельзя.
+     * ========================================================== */
+    DBG_MSG("BL", "08b GOP init...");
+    efi_memset(&g_boot_info.fb, 0, sizeof(fb_info_t));
+    g_boot_info.fb.mode = FB_MODE_VGA; /* fallback */
+    {
+        EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
+        EFI_STATUS gop_status = BS->LocateProtocol(
+            &EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID, NULL, (void **)&gop);
+
+        if (gop_status == EFI_SUCCESS && gop && gop->Mode && gop->Mode->Info) {
+            EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi = gop->Mode->Info;
+
+            g_boot_info.fb.mode     = FB_MODE_LINEAR;
+            g_boot_info.fb.width    = mi->HorizontalResolution;
+            g_boot_info.fb.height   = mi->VerticalResolution;
+            g_boot_info.fb.bpp      = 32;
+            g_boot_info.fb.pitch    = mi->PixelsPerScanLine * 4;
+            g_boot_info.fb.phys_addr = (UINT64)gop->Mode->FrameBufferBase;
+
+            /* Определяем порядок каналов */
+            if (mi->PixelFormat == PixelRedGreenBlueReserved8BitPerColor) {
+                g_boot_info.fb.red_mask   = 0x000000FF;
+                g_boot_info.fb.green_mask = 0x0000FF00;
+                g_boot_info.fb.blue_mask  = 0x00FF0000;
+            } else if (mi->PixelFormat == PixelBitMask) {
+                g_boot_info.fb.red_mask   = mi->PixelInformation.RedMask;
+                g_boot_info.fb.green_mask = mi->PixelInformation.GreenMask;
+                g_boot_info.fb.blue_mask  = mi->PixelInformation.BlueMask;
+            } else {
+                /* PixelBlueGreenRedReserved8BitPerColor (самый частый) и default */
+                g_boot_info.fb.red_mask   = 0x00FF0000;
+                g_boot_info.fb.green_mask = 0x0000FF00;
+                g_boot_info.fb.blue_mask  = 0x000000FF;
+            }
+
+            DBG_VAL("BL", "fb.width",    g_boot_info.fb.width);
+            DBG_VAL("BL", "fb.height",   g_boot_info.fb.height);
+            DBG_VAL("BL", "fb.phys",     g_boot_info.fb.phys_addr);
+            DBG_VAL("BL", "fb.pitch",    g_boot_info.fb.pitch);
+            DBG_VAL("BL", "fb.pixel_fmt",(UINT64)mi->PixelFormat);
+            bl_log(ConOut, "[OK] GOP framebuffer\r\n");
+        } else {
+            DBG_MSG("BL", "GOP not found — VGA fallback");
+            bl_log(ConOut, "[WARN] GOP not found, VGA fallback\r\n");
+        }
+    }
+
+    /* ==========================================================
        GetMemoryMap + ExitBootServices: MapKey устаревает после 
        ЛЮБОГО вызова Boot Service. Между ними не должно быть 
        НИЧЕГО, даже отладочного вывода.
@@ -536,6 +647,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     g_boot_info.pml4_phys = pml4_phys;
     g_boot_info.gdt_ptr = NULL;
     g_boot_info.idt_ptr = NULL;
+    /* g_boot_info.fb уже заполнена выше (до ExitBootServices) */
 
     UINT64 rsp = (UINT64)(UINTN)(bl_exit_stack + sizeof(bl_exit_stack));
     jump_to_kernel_virt(pml4_phys, elf->e_entry, &g_boot_info, rsp); // ИСПРАВЛЕНО: убран пробел

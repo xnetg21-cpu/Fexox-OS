@@ -19,15 +19,38 @@ CFLAGS_BOOT="-I. -ffreestanding -fno-builtin -mno-red-zone -fno-stack-check -fno
 LDFLAGS_BOOT="-nostdlib -nodefaultlibs -Wl,--subsystem,10 -Wl,--image-base=0x10000000 -Wl,--gc-sections -Wl,--emit-relocs -e efi_main"
 
 echo "[*] Ядро..."
-$CC $CFLAGS_KERN -c boot_stub.c -o build/boot_stub.o
-$CC $CFLAGS_KERN -c main.c -o build/main.o
-$CC $CFLAGS_KERN -c MemoryControl.c -o build/MemoryControl.o
+$CC $CFLAGS_KERN -c boot_stub.c        -o build/boot_stub.o
+$CC $CFLAGS_KERN -c main.c             -o build/main.o
+$CC $CFLAGS_KERN -c MemoryControl.c    -o build/MemoryControl.o
 $CC $CFLAGS_KERN -c InterruptControl.c -o build/InterruptControl.o
-$CC $CFLAGS_KERN -c Scheduler.c -o build/Scheduler.o
-$CC $CFLAGS_KERN -c VFS.c      -o build/VFS.o
-$CC $CFLAGS_KERN -c FAT32.c    -o build/FAT32.o
-$CC $CFLAGS_KERN -c klibc.c    -o build/klibc.o
-$LD_KERN $LDFLAGS_KERN -o build/kernel.bin build/boot_stub.o build/main.o build/MemoryControl.o build/InterruptControl.o build/Scheduler.o build/VFS.o build/FAT32.o build/klibc.o
+$CC $CFLAGS_KERN -c Scheduler.c        -o build/Scheduler.o
+$CC $CFLAGS_KERN -c Syscall.c          -o build/Syscall.o
+$CC $CFLAGS_KERN -c VFS.c              -o build/VFS.o
+$CC $CFLAGS_KERN -c FAT32.c            -o build/FAT32.o
+$CC $CFLAGS_KERN -c IDE.c              -o build/IDE.o
+$CC $CFLAGS_KERN -c AHCI.c             -o build/AHCI.o
+$CC $CFLAGS_KERN -c klibc.c            -o build/klibc.o
+$CC $CFLAGS_KERN -c ELF64.c            -o build/ELF64.o
+$CC $CFLAGS_KERN -c Framebuffer.c      -o build/Framebuffer.o
+$CC $CFLAGS_KERN -c png.c              -o build/png.o
+$CC $CFLAGS_KERN -c ui_extra.c         -o build/ui_extra.o
+
+$LD_KERN $LDFLAGS_KERN -o build/kernel.bin \
+    build/boot_stub.o      \
+    build/main.o           \
+    build/MemoryControl.o  \
+    build/InterruptControl.o \
+    build/Scheduler.o      \
+    build/Syscall.o        \
+    build/VFS.o            \
+    build/FAT32.o          \
+    build/IDE.o            \
+    build/AHCI.o           \
+    build/klibc.o          \
+    build/ELF64.o          \
+    build/Framebuffer.o    \
+    build/png.o            \
+    build/ui_extra.o
 
 echo "[*] Загрузчик UEFI..."
 $MGW $CFLAGS_BOOT -c bootloader.c -o build/bootloader.o
@@ -47,10 +70,10 @@ if command -v mformat >/dev/null; then
     dd if=/dev/zero of=build/esp.img bs=1M count=64 status=none
     mformat -i build/esp.img -F -v FEXOS ::
     mmd -i build/esp.img ::EFI ::EFI/BOOT
-    
+
     mcopy -i build/esp.img build/bootloader.efi ::EFI/BOOT/BOOTX64.EFI
     mcopy -i build/esp.img build/kernel.bin ::kernel.bin
-    
+
     # Создаем startup.nsh и добавляем его в корень образа esp.img
     echo "fs0:" > build/startup.nsh
     echo "\\EFI\\BOOT\\BOOTX64.EFI" >> build/startup.nsh
@@ -62,7 +85,28 @@ if command -v mformat >/dev/null; then
     echo "[*] Диск build/data.img (virtio-blk data disk)..."
     dd if=/dev/zero of=build/data.img bs=1M count=64 status=none
     mformat -i build/data.img -F -v FEXDATA ::
+
+    # Если есть готовый статический init — кладём его на data.img
+    if [ -f "init" ]; then
+        echo "[*] Добавляем /init на data.img..."
+        mcopy -i build/data.img init ::init
+        echo "[OK] /init добавлен"
+    fi
+
     echo "[OK] build/data.img готов"
+
+    # UI ресурсы (обои, курсор и т.п.)
+    if [ -d "UI" ]; then
+        echo "[*] Добавляем папку UI/ на data.img..."
+        mmd -i build/data.img ::UI 2>/dev/null || true
+        for f in UI/*; do
+            [ -f "$f" ] || continue
+            mcopy -i build/data.img "$f" "::UI/$(basename "$f")"
+            echo "[OK] $f -> ::UI/$(basename "$f")"
+        done
+    else
+        echo "[!] Папка UI/ не найдена рядом со скриптом — обои/курсор не будут скопированы"
+    fi
 else
     echo "[!] mtools нет — pacman -S mingw-w64-ucrt-x86_64-mtools"
 fi

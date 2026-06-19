@@ -462,6 +462,11 @@ static void context_switch(sched_frame_t *frame) {
 void sched_tick(void *raw_frame) {
     if (!g_sched.ready) return;
 
+    /* Курсор (PNG + альфа) и "тикающие" часы — рисуются вне блокировки
+     * планировщика, чтобы не задерживать переключение контекста. */
+    extern void ui_tick(void);
+    ui_tick();
+
     sched_frame_t *frame = (sched_frame_t *)raw_frame;
 
     spinlock_acquire(&g_sched.lock);
