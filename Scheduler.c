@@ -20,6 +20,10 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+/* Прямые вызовы для логирования (без kmalloc рекурсии) */
+extern void dbg_puts(const char *s);
+extern void dbg_hex64(uint64_t v);
+
 /* -------------------------------------------------------------------------
  * Внешние зависимости
  * ------------------------------------------------------------------------- */
@@ -30,17 +34,18 @@ extern void   interrupt_set_scheduler_tick(void (*fn)(void *));
 /* -------------------------------------------------------------------------
  * Spinlock — однопроцессорная реализация через CLI/STI
  * На UP-ядре достаточно маскировать прерывания.
+ * Сохраняем/восстанавливаем EFLAGS чтобы sti не вызвал #GP если IF=0.
  * ------------------------------------------------------------------------- */
 typedef volatile int spinlock_t;
 
 static inline void spinlock_acquire(spinlock_t *l) {
     (void)l;
-    __asm__ volatile ("cli" ::: "memory");
+    __asm__ volatile ("pushfq\n\tcli\n\tpopfq" ::: "memory");
 }
 
 static inline void spinlock_release(spinlock_t *l) {
     (void)l;
-    __asm__ volatile ("sti" ::: "memory");
+    __asm__ volatile ("pushfq\n\tsti\n\tpopfq" ::: "memory");
 }
 
 /* TSC для измерения времени */
@@ -274,8 +279,14 @@ static void task_wrapper(void (*fn)(void *), void *arg) {
 }
 
 static int setup_kstack(task_t *t, void (*fn)(void *), void *arg) {
+    DBG_VAL("SC", "setup_kstack: request size", t->kstack_size);
     uint8_t *stack = (uint8_t *)kmalloc(t->kstack_size);
-    if (!stack) return -1;
+    DBG_VAL("SC", "setup_kstack: kmalloc result", (uint64_t)(uintptr_t)stack);
+    if (!stack) {
+        DBG_MSG("SC", "setup_kstack: FAILED - kmalloc returned NULL");
+        return -1;
+    }
+    DBG_VAL("SC", "setup_kstack: zeroing stack", (uint64_t)(uintptr_t)stack);
     kmemset_s(stack, 0, t->kstack_size);
     t->kstack_base = stack;
 
@@ -310,19 +321,24 @@ static int setup_kstack(task_t *t, void (*fn)(void *), void *arg) {
  * sched_init
  * ------------------------------------------------------------------------- */
 int sched_init(void) {
+    dbg_puts("[SC] sched_init: START\n");
+    
     kmemset_s(&g_sched, 0, sizeof(g_sched));
     g_sched.next_tid = 1;
     g_sched.lock     = 0;
     g_sched.ready    = false;
 
-    /* Создаём idle-задачу вручную (не через sched_create_kthread, т.к.
-       планировщик ещё не готов) */
-    task_t *idle = alloc_task();
+    dbg_puts("[SC] sched_init: calling kmalloc for idle\n");
+    task_t *idle = (task_t *)kmalloc(sizeof(task_t));
+    dbg_puts("[SC] sched_init: kmalloc result=");
+    dbg_hex64((uint64_t)(uintptr_t)idle);
+    dbg_puts("\n");
+    
     if (!idle) return -1;
 
     idle->tid      = 0;
     idle->state    = TASK_RUNNABLE;
-    idle->priority = SCHED_PRIO_MAX; /* наименьший приоритет */
+    idle->priority = SCHED_PRIO_MAX;
     idle->weight   = prio_to_w(SCHED_PRIO_MAX);
     idle->vruntime = 0;
     idle->kstack_size = SCHED_KSTACK_SIZE;
@@ -338,11 +354,9 @@ int sched_init(void) {
     g_sched.all_head = idle;
     g_sched.task_count = 1;
 
-    /* Регистрируем обработчик таймера */
     interrupt_set_scheduler_tick(sched_tick);
 
     g_sched.ready = true;
-    DBG_MSG("SC", "sched_init ok");
     return 0;
 }
 

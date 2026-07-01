@@ -11,6 +11,10 @@ extern "C" {
 #include <stdint.h>
 #include "debug_out.h"
 
+/* Прямые вызовы для логирования */
+extern void dbg_puts(const char *s);
+extern void dbg_hex64(uint64_t v);
+
 /* ==========================================================================
 БАЗОВЫЕ ТИПЫ И КОНСТАНТЫ
 ========================================================================== */
@@ -72,14 +76,14 @@ static inline uint32_t ctz64(uint64_t v) {
 #endif
 }
 
-/* Spinlock */
+/* Spinlock — пустая реализация для UP (прерывания запрещены на уровне ядра) */
 typedef volatile uint32_t spinlock_t;
 static inline void spinlock_init(spinlock_t *l) { *l = 0; }
 static inline void spinlock_acquire(spinlock_t *l) {
-    while (__sync_lock_test_and_set(l, 1)) __asm__ volatile ("pause" ::: "memory");
+    (void)l;
 }
 static inline void spinlock_release(spinlock_t *l) {
-    __asm__ volatile ("movl $0, %0" : "=m" (*l) : : "memory");
+    (void)l;
 }
 
 /* ==========================================================================
@@ -464,26 +468,67 @@ KERNEL HEAP
 #define KM_SIZE_CLASSES 12
 #define KM_CLASS_SIZE(i) (KM_MIN_SIZE << (i))
 
-typedef struct km_block { size_t size; bool free; struct km_block *next; struct km_block *prev; } km_block_t;
-typedef struct { km_block_t *free_lists[KM_SIZE_CLASSES]; spinlock_t lock; virt_addr_t heap_end; size_t heap_used; } km_ctx_t;
+/*
+ * ВАЖНО: next/prev — это указатели ТОЛЬКО для двусвязного списка свободных
+ * блоков данного size-class'а (валидны, только пока block->free == true).
+ * phys_prev — отдельный указатель на блок, который располагается ФИЗИЧЕСКИ
+ * непосредственно перед текущим в куче (NULL, если это самый первый блок
+ * кучи). Он поддерживается всегда, независимо от free/allocated, и нужен
+ * чтобы при kfree() можно было корректно найти физического соседа слева
+ * для слияния (boundary-merge), не путая его со случайным мусором,
+ * оставшимся в next/prev от предыдущего пребывания блока в фри-листе.
+ */
+typedef struct km_block {
+    size_t size;
+    bool free;
+    struct km_block *next;       /* free-list link (валиден только если free) */
+    struct km_block *prev;       /* free-list link (валиден только если free) */
+    struct km_block *phys_prev;  /* физически предыдущий блок в куче, либо NULL */
+} km_block_t;
+typedef struct {
+    km_block_t *free_lists[KM_SIZE_CLASSES];
+    spinlock_t lock;
+    virt_addr_t heap_end;
+    size_t heap_used;
+    km_block_t *last_block;      /* физически последний блок в куче (NULL если куча пуста) */
+} km_ctx_t;
 
 static km_ctx_t g_km;
+
+static void km_list_unlink(km_block_t *b);
 
 static inline size_t km_size_class(size_t sz) {
     if (sz <= KM_MIN_SIZE) return 0;
     size_t a = ROUND_UP(sz, KM_MIN_SIZE);
     size_t c = 0;
-    while (KM_CLASS_SIZE(c) < a && c < KM_SIZE_CLASSES - 1) c++;
+    while (KM_CLASS_SIZE(c) < a && c < (size_t)(KM_SIZE_CLASSES - 1)) c++;
     return c;
 }
 
 static km_block_t *km_find_best(size_t req) {
     size_t c = km_size_class(req);
+    
+    dbg_puts("[KM] km_find_best: req=");
+    dbg_hex64(req);
+    dbg_puts(" class=");
+    dbg_hex64(c);
+    dbg_puts("\n");
+    
     km_block_t *best = NULL;
     size_t best_diff = (size_t)-1;
     for (size_t i = c; i < KM_SIZE_CLASSES; i++) {
         km_block_t *b = g_km.free_lists[i];
         while (b) {
+            /* Проверка валидности указателя */
+            if ((uint64_t)(uintptr_t)b < (uint64_t)(uintptr_t)DIRECT_MAP_OFFSET) {
+                dbg_puts("[KM] km_find_best: INVALID ptr=");
+                dbg_hex64((uint64_t)(uintptr_t)b);
+                dbg_puts(" in list[");
+                dbg_hex64(i);
+                dbg_puts("]\n");
+                break;
+            }
+            
             if (b->free && b->size >= req) {
                 size_t diff = b->size - req;
                 if (diff < best_diff) { best_diff = diff; best = b; }
@@ -498,24 +543,39 @@ static km_block_t *km_find_best(size_t req) {
     return NULL;
 
 found:
-    if (best->prev) best->prev->next = best->next;
-    else g_km.free_lists[km_size_class(best->size)] = best->next;
-    
-    if (best->next) best->next->prev = best->prev;
-    
+    km_list_unlink(best);
+
     if (best->size >= req + sizeof(km_block_t) + KM_MIN_SIZE) {
+        size_t orig_size = best->size;
         km_block_t *rem = (km_block_t *)((uint8_t *)best + sizeof(km_block_t) + req);
-        rem->size = best->size - sizeof(km_block_t) - req;
+        rem->size = orig_size - sizeof(km_block_t) - req;
         rem->free = true;
         rem->next = NULL;
         rem->prev = NULL;
+        rem->phys_prev = best;
+
+        /* Блок, который раньше шёл физически сразу после best (если был),
+         * теперь должен ссылаться на rem, а не на best — best стал короче. */
+        km_block_t *old_next = (km_block_t *)((uint8_t *)best + sizeof(km_block_t) + orig_size);
+        if ((uint8_t *)old_next < (uint8_t *)g_km.heap_end) {
+            old_next->phys_prev = rem;
+        } else {
+            /* best был последним блоком кучи — теперь им стал rem */
+            g_km.last_block = rem;
+        }
+
         size_t r_class = km_size_class(rem->size);
         rem->next = g_km.free_lists[r_class];
         if (g_km.free_lists[r_class]) g_km.free_lists[r_class]->prev = rem;
         g_km.free_lists[r_class] = rem;
+
         best->size = req;
     }
     best->free = false;
+    /* next/prev были указателями free-list'а и сейчас бессмысленны —
+     * обнуляем, чтобы не оставлять "грязных" значений в занятом блоке. */
+    best->next = NULL;
+    best->prev = NULL;
     return best;
 }
 
@@ -526,6 +586,26 @@ static void km_insert_free(km_block_t *b) {
     b->prev = NULL;
     if (g_km.free_lists[c]) g_km.free_lists[c]->prev = b;
     g_km.free_lists[c] = b;
+}
+
+/*
+ * Корректно отвязывает блок b от его текущего free-list, независимо от того,
+ * в голове он, в середине или в хвосте списка. ДОЛЖЕН вызываться, пока
+ * b->size ещё не изменён (класс размера вычисляется из текущего b->size).
+ * После вызова next/prev блока b сброшены — он больше нигде не зарегистрирован.
+ */
+static void km_list_unlink(km_block_t *b) {
+    size_t c = km_size_class(b->size);
+    if (b->prev) {
+        b->prev->next = b->next;
+    } else if (g_km.free_lists[c] == b) {
+        g_km.free_lists[c] = b->next;
+    }
+    if (b->next) {
+        b->next->prev = b->prev;
+    }
+    b->next = NULL;
+    b->prev = NULL;
 }
 
 static int km_expand(size_t min_bytes) {
@@ -551,6 +631,11 @@ static int km_expand(size_t min_bytes) {
     blk->free = true;
     blk->next = NULL;
     blk->prev = NULL;
+    /* Новый блок всегда располагается ровно там, где раньше заканчивалась
+     * куча, поэтому его физический предшественник — это блок, который был
+     * последним до расширения (если куча уже не пуста). */
+    blk->phys_prev = g_km.last_block;
+    g_km.last_block = blk;
     km_insert_free(blk);
     g_km.heap_end = va + (pages << PAGE_SHIFT);
     return 0;
@@ -562,20 +647,53 @@ void *kmalloc(size_t size) {
     }
     size = ROUND_UP(size, 16);
     
+    /* Проверка что g_km инициализирована */
+    if (!g_km.heap_end) {
+        dbg_puts("[KM] kmalloc: heap_end=0\n");
+        return NULL;
+    }
+    
+    dbg_puts("[KM] kmalloc: size=");
+    dbg_hex64(size);
+    dbg_puts(" heap_end=");
+    dbg_hex64((uint64_t)(uintptr_t)g_km.heap_end);
+    dbg_puts(" &g_km=");
+    dbg_hex64((uint64_t)(uintptr_t)&g_km);
+    dbg_puts("\n");
+    
     spinlock_acquire(&g_km.lock);
+    
+    dbg_puts("[KM] kmalloc: spinlock acquired\n");
+    
     km_block_t *b = km_find_best(size);
+    
+    dbg_puts("[KM] kmalloc: km_find_best=");
+    dbg_hex64((uint64_t)(uintptr_t)b);
+    dbg_puts("\n");
+    
     if (!b) {
+        dbg_puts("[KM] kmalloc: expanding\n");
         if (km_expand(size) != 0) {
+            dbg_puts("[KM] kmalloc: expand FAILED\n");
             spinlock_release(&g_km.lock);
             return NULL;
         }
+        dbg_puts("[KM] kmalloc: expand OK, retry\n");
         b = km_find_best(size);
     }
     spinlock_release(&g_km.lock);
-    if (!b) return NULL;
+    
+    if (!b) {
+        dbg_puts("[KM] kmalloc: still NULL\n");
+        return NULL;
+    }
     
     g_km.heap_used += b->size + sizeof(km_block_t);
-    return (void *)((uint8_t *)b + sizeof(km_block_t));
+    void *result = (void *)((uint8_t *)b + sizeof(km_block_t));
+    dbg_puts("[KM] kmalloc: return=");
+    dbg_hex64((uint64_t)(uintptr_t)result);
+    dbg_puts("\n");
+    return result;
 }
 
 void kfree(void *ptr) {
@@ -583,28 +701,44 @@ void kfree(void *ptr) {
         return;
     }
     km_block_t *b = (km_block_t *)((uint8_t *)ptr - sizeof(km_block_t));
-    if (b->free) return;
-    
+    if (b->free) return; /* защита от double-free */
+
     spinlock_acquire(&g_km.lock);
     b->free = true;
     g_km.heap_used -= b->size + sizeof(km_block_t);
-    
+
+    /* --- Слияние с физически СЛЕДУЮЩИМ блоком (если он свободен) --- */
     km_block_t *next = (km_block_t *)((uint8_t *)b + sizeof(km_block_t) + b->size);
     if ((uint8_t *)next < (uint8_t *)g_km.heap_end && next->free) {
+        km_list_unlink(next);           /* корректно убираем next из ЛЮБОЙ позиции в его free-list */
         b->size += sizeof(km_block_t) + next->size;
-        if (next->next) next->next->prev = b;
-        size_t c = km_size_class(next->size);
-        if (g_km.free_lists[c] == next) g_km.free_lists[c] = next->next;
+
+        km_block_t *after_next = (km_block_t *)((uint8_t *)next + sizeof(km_block_t) + next->size);
+        if ((uint8_t *)after_next < (uint8_t *)g_km.heap_end) {
+            after_next->phys_prev = b;   /* был next, теперь физпредшественник — b */
+        } else {
+            g_km.last_block = b;         /* next был последним блоком кучи */
+        }
     }
-    
-    if (b->prev && b->prev->free) {
-        b->prev->size += sizeof(km_block_t) + b->size;
-        if (b->next) b->next->prev = b->prev;
-        size_t c = km_size_class(b->size);
-        if (g_km.free_lists[c] == b) g_km.free_lists[c] = b->prev;
-    } else {
-        km_insert_free(b);
+
+    /* --- Слияние с физически ПРЕДЫДУЩИМ блоком (если он свободен) ---
+     * Используем НАСТОЯЩИЙ физический указатель phys_prev, а не next/prev
+     * (которые относятся только к free-list и могут быть "грязными"). */
+    km_block_t *prevb = b->phys_prev;
+    if (prevb && prevb->free) {
+        km_list_unlink(prevb);
+        prevb->size += sizeof(km_block_t) + b->size;
+
+        km_block_t *after_b = (km_block_t *)((uint8_t *)b + sizeof(km_block_t) + b->size);
+        if ((uint8_t *)after_b < (uint8_t *)g_km.heap_end) {
+            after_b->phys_prev = prevb;
+        } else {
+            g_km.last_block = prevb;
+        }
+        b = prevb; /* объединённый блок теперь представлен prevb */
     }
+
+    km_insert_free(b);
     spinlock_release(&g_km.lock);
 }
 
