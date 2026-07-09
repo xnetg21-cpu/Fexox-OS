@@ -29,7 +29,7 @@ extern void dbg_hex64(uint64_t v);
  * ------------------------------------------------------------------------- */
 extern void  *kmalloc(uint64_t size);
 extern void   kfree(void *ptr);
-extern void   interrupt_set_scheduler_tick(void (*fn)(void *));
+extern void   interrupt_set_scheduler_tick(uint64_t (*fn)(uint64_t frame_rsp));
 
 /* -------------------------------------------------------------------------
  * Spinlock — однопроцессорная реализация через CLI/STI
@@ -407,20 +407,30 @@ int sched_create_kthread(void (*fn)(void *), void *arg,
 /* -------------------------------------------------------------------------
  * Ядро переключения контекста
  *
- * Вызывается из sched_tick (в контексте прерывания).
- * frame — указатель на cpu_frame_t на стеке прерывания.
+ * Вызывается из sched_tick (в контексте прерывания, на СТЕКЕ прерванной
+ * задачи). frame_rsp — значение RSP на момент входа в обработчик, т.е.
+ * указатель на cpu_frame_t (см. setup_kstack) на СОБСТВЕННОМ стеке
+ * прерванной задачи.
  *
  * Что делаем:
- *   1. Сохраняем rsp текущей задачи (указывает на frame).
+ *   1. Запоминаем frame_rsp как ctx.rsp прерванной задачи "как есть" —
+ *      это её собственный стек, его содержимое НЕ трогаем.
  *   2. Обновляем vruntime текущей задачи.
  *   3. Если текущая задача ещё RUNNING — переводим в RUNNABLE, кладём в rq.
  *   4. Выбираем следующую задачу.
- *   5. Подменяем frame->rsp и frame->rip — iret уйдёт в следующую задачу.
+ *   5. Возвращаем next->ctx.rsp — это RSP на СОБСТВЕННОМ стеке next,
+ *      куда naked-стаб (irq0_timer_isr) переключит RSP перед pop+iretq.
  *
- * Важно: мы не переключаем CR3 здесь, т.к. все kernel-потоки в одном
- * адресном пространстве. Для user-mode нужно добавить переключение CR3.
+ * ВАЖНО: раньше здесь копировалось содержимое next_frame поверх frame
+ * (т.е. поверх стека ПРЕРВАННОЙ задачи). Это ломало сохранённое состояние
+ * prev — при следующем переключении на неё восстанавливались чужие
+ * регистры, что и приводило к #GP. Правильный подход — не копировать
+ * данные между стеками, а переключать сам регистр RSP на чужой стек.
+ *
+ * Мы не переключаем CR3 здесь, т.к. все kernel-потоки в одном адресном
+ * пространстве. Для user-mode нужно добавить переключение CR3.
  * ------------------------------------------------------------------------- */
-static void context_switch(sched_frame_t *frame) {
+static uint64_t context_switch(uint64_t frame_rsp) {
     task_t *prev = g_sched.current;
     uint64_t now_tsc = rdtsc();
 
@@ -437,9 +447,9 @@ static void context_switch(sched_frame_t *frame) {
 
     update_min_vruntime();
 
-    /* Сохраняем rsp текущей задачи */
+    /* Сохраняем rsp текущей задачи — это её собственный стек, не трогаем */
     if (prev) {
-        prev->ctx.rsp = (uint64_t)(uintptr_t)frame;
+        prev->ctx.rsp = frame_rsp;
         if (prev->state == TASK_RUNNING) {
             prev->state = TASK_RUNNABLE;
             if (prev != g_sched.idle)
@@ -457,31 +467,26 @@ static void context_switch(sched_frame_t *frame) {
     g_sched.current = next;
     g_sched.slice_start_tsc = now_tsc;
 
-    /* Восстанавливаем контекст следующей задачи:
-       подменяем стековый фрейм на фрейм следующей задачи.
-       iret возьмёт rip, cs, rflags, rsp, ss из того места куда
-       мы поставим стек. Для этого копируем сохранённый фрейм. */
-    sched_frame_t *next_frame = (sched_frame_t *)(uintptr_t)next->ctx.rsp;
-
-    /* Копируем фрейм следующей задачи поверх текущего (без memcpy) */
-    uint64_t *dst = (uint64_t *)frame;
-    uint64_t *src2 = (uint64_t *)next_frame;
-    for (int i = 0; i < (int)(sizeof(sched_frame_t) / sizeof(uint64_t)); i++)
-        dst[i] = src2[i];
+    /* Возвращаем RSP следующей задачи — на него переключится сам стек
+     * (не данные) в naked-стабе irq0_timer_isr, после чего оттуда же
+     * будут выполнены pop регистров и iretq. */
+    return next->ctx.rsp;
 }
 
 /* -------------------------------------------------------------------------
  * sched_tick — обработчик таймерного прерывания
+ *
+ * frame_rsp — RSP на момент входа (см. irq0_timer_isr в InterruptControl.c).
+ * Возвращает RSP, на который стаб должен переключиться перед pop+iretq:
+ * либо тот же frame_rsp (без переключения), либо ctx.rsp следующей задачи.
  * ------------------------------------------------------------------------- */
-void sched_tick(void *raw_frame) {
-    if (!g_sched.ready) return;
+uint64_t sched_tick(uint64_t frame_rsp) {
+    if (!g_sched.ready) return frame_rsp;
 
     /* Курсор (PNG + альфа) и "тикающие" часы — рисуются вне блокировки
      * планировщика, чтобы не задерживать переключение контекста. */
     extern void ui_tick(void);
     ui_tick();
-
-    sched_frame_t *frame = (sched_frame_t *)raw_frame;
 
     spinlock_acquire(&g_sched.lock);
 
@@ -507,10 +512,12 @@ void sched_tick(void *raw_frame) {
     if (cur == g_sched.idle && g_sched.rq.size > 0)
         need_switch = true;
 
+    uint64_t resume_rsp = frame_rsp;
     if (need_switch)
-        context_switch(frame);
+        resume_rsp = context_switch(frame_rsp);
 
     spinlock_release(&g_sched.lock);
+    return resume_rsp;
 }
 
 /* -------------------------------------------------------------------------

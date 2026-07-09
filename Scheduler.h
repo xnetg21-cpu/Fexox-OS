@@ -136,7 +136,7 @@ task_t *sched_current(void);
 task_t *sched_find(uint32_t tid);
 
 /* Обработчик таймерного прерывания — передаётся в interrupt_set_scheduler_tick */
-void sched_tick(void *frame);
+uint64_t sched_tick(uint64_t frame_rsp);
 
 /* Статистика: число живых задач */
 uint32_t sched_task_count(void);

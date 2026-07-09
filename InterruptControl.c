@@ -59,6 +59,9 @@ static idt_entry_t g_idt[IDT_ENTRIES] __attribute__((aligned(16)));
 typedef void (*isr_handler_t)(uint64_t num, uint64_t err, cpu_frame_t *frame);
 static isr_handler_t g_isr_handlers[IDT_ENTRIES];
 
+/* forward decl: нужна в irq_dispatch, определена ниже */
+void apic_send_eoi(uint8_t vector);
+
 /* ==========================================================================
 АППАРАТНЫЕ ОПЕРАЦИИ
 ========================================================================== */
@@ -198,8 +201,17 @@ static void exception_dispatch(uint8_t num, uint64_t err, cpu_frame_t *frame) {
 }
 
 static void irq_dispatch(uint8_t num, cpu_frame_t *frame) {
-    (void)frame;
     if (g_isr_handlers[num]) g_isr_handlers[num](num, 0, frame);
+    /* КРИТИЧНО: без EOI LAPIC считает вектор "всё ещё в обработке"
+     * и никогда не доставит следующее прерывание этого вектора
+     * (таймер, клавиатура и т.п.). PIC отключён (pic_disable() в
+     * interrupt_init) — работаем только через LAPIC, поэтому шлём
+     * EOI туда, а не в 8259. Раньше EOI не отправлялся вообще,
+     * из-за чего таймер срабатывал ровно один раз за всю работу
+     * ядра — отсюда "часы не тикают" и "курсор не обновляется"
+     * (ui_tick вызывается только из sched_tick, который висит на
+     * этом же таймерном прерывании). */
+    apic_send_eoi(num);
 }
 
 /* --- Исключения БЕЗ кода ошибки --- */
@@ -228,7 +240,78 @@ __attribute__((interrupt)) void exc_17(cpu_frame_t *frame, uint64_t err) { excep
 __attribute__((interrupt)) void exc_30(cpu_frame_t *frame, uint64_t err) { exception_dispatch(30, err, frame); }
 
 /* --- IRQ Handlers --- */
-__attribute__((interrupt)) void irq_0(cpu_frame_t *frame)  { irq_dispatch(0x20, frame); }
+/*
+ * irq0_timer_isr — обработчик таймера (LAPIC, вектор 0x20).
+ *
+ * ПОЧЕМУ НЕ __attribute__((interrupt)):
+ * Этот атрибут сам решает, какие регистры сохранять и в каком порядке —
+ * это деталь реализации компилятора, НЕ ABI, и адресация "лишних" полей
+ * cpu_frame_t (r15..rax, error_code), которые атрибут не обязан класть
+ * именно туда, была undefined behavior. Пока обработчики (page fault,
+ * exceptions) эти поля не читали — всё "работало". Но планировщику нужно
+ * реально переключать RSP на стек другой задачи, а для этого нужен
+ * ПОЛНЫЙ контроль над тем, что и в каком порядке кладётся/снимается со
+ * стека. Отсюда — ручной naked-стаб.
+ *
+ * Смещения полей должны точно совпадать с cpu_frame_t (и sched_frame_t
+ * в Scheduler.c) и с тем, что строит setup_kstack() для новых задач:
+ *   r15,r14,r13,r12,r11,r10,r9,r8, rdi,rsi,rbp,rdx,rcx,rbx,rax,
+ *   error_code, rip, cs, rflags, [rsp, ss — не используются iretq
+ *   при переходе ring0->ring0, но хранятся для симметрии].
+ *
+ * Логика:
+ *   1. Кладём фиктивный error_code (у IRQ0 его нет).
+ *   2. Пушим регистры в порядке, который после всех push даёт RSP,
+ *      указывающий ровно на начало cpu_frame_t (поле r15).
+ *   3. Зовём timer_isr_c(rsp) — она шлёт EOI, вызывает планировщик и
+ *      возвращает RSP, с которого продолжать: тот же (без переключения)
+ *      либо RSP другой задачи (реальное переключение стека).
+ *   4. Переключаем RSP на то, что вернула timer_isr_c.
+ *   5. Снимаем регистры в обратном порядке с ЭТОГО (возможно, чужого)
+ *      стека и делаем iretq — так мы восстанавливаем чужие регистры
+ *      и продолжаем выполнение чужой задачи.
+ */
+__attribute__((naked)) void irq0_timer_isr(void) {
+    __asm__ volatile (
+        "push $0\n\t"              /* фиктивный error_code */
+        "push %%rax\n\t"
+        "push %%rbx\n\t"
+        "push %%rcx\n\t"
+        "push %%rdx\n\t"
+        "push %%rbp\n\t"
+        "push %%rsi\n\t"
+        "push %%rdi\n\t"
+        "push %%r8\n\t"
+        "push %%r9\n\t"
+        "push %%r10\n\t"
+        "push %%r11\n\t"
+        "push %%r12\n\t"
+        "push %%r13\n\t"
+        "push %%r14\n\t"
+        "push %%r15\n\t"
+        "mov %%rsp, %%rdi\n\t"     /* rdi = &cpu_frame_t (аргумент №1 SysV) */
+        "call timer_isr_c\n\t"     /* rax = RSP, с которого продолжать */
+        "mov %%rax, %%rsp\n\t"     /* переключаемся на (возможно чужой) стек */
+        "pop %%r15\n\t"
+        "pop %%r14\n\t"
+        "pop %%r13\n\t"
+        "pop %%r12\n\t"
+        "pop %%r11\n\t"
+        "pop %%r10\n\t"
+        "pop %%r9\n\t"
+        "pop %%r8\n\t"
+        "pop %%rdi\n\t"
+        "pop %%rsi\n\t"
+        "pop %%rbp\n\t"
+        "pop %%rdx\n\t"
+        "pop %%rcx\n\t"
+        "pop %%rbx\n\t"
+        "pop %%rax\n\t"
+        "add $8, %%rsp\n\t"        /* убрать фиктивный error_code */
+        "iretq\n\t"
+        ::: "memory"
+    );
+}
 __attribute__((interrupt)) void irq_1(cpu_frame_t *frame)  { irq_dispatch(0x21, frame); }
 __attribute__((interrupt)) void irq_2(cpu_frame_t *frame)  { irq_dispatch(0x22, frame); }
 __attribute__((interrupt)) void irq_3(cpu_frame_t *frame)  { irq_dispatch(0x23, frame); }
@@ -385,7 +468,7 @@ static void apic_timer_start(uint32_t freq_hz) {
 /* ==========================================================================
 РЕГИСТРАЦИЯ И ИНИЦИАЛИЗАЦИЯ
 ========================================================================== */
-typedef void (*scheduler_tick_fn_t)(cpu_frame_t *frame);
+typedef uint64_t (*scheduler_tick_fn_t)(uint64_t frame_rsp);
 static scheduler_tick_fn_t g_sched_tick = NULL;
 
 int interrupt_register_handler(uint16_t vector, isr_handler_t handler) {
@@ -398,9 +481,14 @@ void interrupt_set_scheduler_tick(scheduler_tick_fn_t fn) { g_sched_tick = fn; }
 void interrupt_enable(void) { sti(); }
 void interrupt_disable(void) { cli(); }
 
-static void timer_handler(uint64_t num, uint64_t err, cpu_frame_t *frame) {
-    (void)num; (void)err;
-    if (g_sched_tick) g_sched_tick(frame);
+/* Вызывается ИЗ naked-стаба irq0_timer_isr (см. ниже), а не через
+ * g_isr_handlers/irq_dispatch — таймеру нужен настоящий сырой доступ
+ * к регистрам ради переключения контекста, что несовместимо с
+ * __attribute__((interrupt)) (см. комментарий у irq0_timer_isr). */
+uint64_t timer_isr_c(uint64_t frame_rsp) {
+    apic_send_eoi(TIMER_VECTOR);
+    if (g_sched_tick) return g_sched_tick(frame_rsp);
+    return frame_rsp;
 }
 
 int interrupt_init(uint64_t ioapic_phys_addr, uint32_t timer_freq_hz) {
@@ -419,8 +507,7 @@ int interrupt_init(uint64_t ioapic_phys_addr, uint32_t timer_freq_hz) {
     apic_calibrate_timer();
 
     g_isr_handlers[14] = NULL;
-    g_isr_handlers[TIMER_VECTOR] = timer_handler;
- 
+
     uint16_t cs; __asm__ volatile ("mov %%cs, %0" : "=r"(cs));
 
     /* Exceptions */
@@ -448,7 +535,7 @@ int interrupt_init(uint64_t ioapic_phys_addr, uint32_t timer_freq_hz) {
     idt_set_gate(30, exc_30, cs, 0, IDT_GATE_INT);
 
     /* IRQs */
-    idt_set_gate(0x20, irq_0,  cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x20, irq0_timer_isr, cs, 0, IDT_GATE_INT);
     idt_set_gate(0x21, irq_1,  cs, 0, IDT_GATE_INT);
     idt_set_gate(0x22, irq_2,  cs, 0, IDT_GATE_INT);
     idt_set_gate(0x23, irq_3,  cs, 0, IDT_GATE_INT);

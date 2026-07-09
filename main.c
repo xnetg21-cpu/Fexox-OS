@@ -13,6 +13,7 @@ extern "C" {
 #include "Syscall.h"
 #include "Framebuffer.h"
 #include "ui_extra.h"
+#include "PS2Mouse.h"
 
 /* -------------------------------------------------------------------------
  * IDE / AHCI драйверы
@@ -82,11 +83,17 @@ static void kprint_err(const char *msg, int code) {
 }
 
 /*
- * kout — универсальный вывод: после fb_init пишет в fbcon,
- * до fb_init (и при VGA fallback) — через kprint (VGA text + COM1).
- * Вызывается в kernel_entry вместо kprint для красивого вывода.
+ * kout — универсальный вывод: после fb_init и ДО отрисовки рабочего стола
+ * пишет в fbcon (виден на экране как загрузочный лог), после
+ * ui_draw_desktop() — только в serial (COM1), чтобы не рисовать текст
+ * поверх уже готового рабочего стола (иначе строки вроде "[OK] scheduler"
+ * остаются на экране навсегда, т.к. ui_tick()/ui_redraw_clock() трогают
+ * только области курсора и часов, а не весь экран).
  */
+static bool g_ui_desktop_shown = false;
+
 static void kout(const char *str) {
+    if (g_ui_desktop_shown) { dbg_puts(str); return; }
     if (fb_get_mode() == FB_MODE_LINEAR)
         fbcon_puts(str);
     else
@@ -641,10 +648,17 @@ skip_fs:;
     DBG_MSG("KR", "25 ui_draw_desktop...");
     ui_draw_desktop();
     DBG_MSG("KR", "25 ui ok");
+    g_ui_desktop_shown = true;  /* с этого момента kout() -> serial only */
 
     DBG_MSG("KR", "25b ui_extra_init (cursor.png + tick clock)...");
     ui_extra_init();
     DBG_MSG("KR", "25b ui_extra ok");
+
+    DBG_MSG("KR", "25c ps2_mouse_init...");
+    if (ps2_mouse_init() != 0)
+        DBG_MSG("KR", "25c ps2 mouse not found (курсор останется неподвижным)");
+    else
+        DBG_MSG("KR", "25c ps2 mouse ok");
 
     /* --- Планировщик (после mount — blk I/O уже не нужен на boot path) --- */
     DBG_MSG("KR", "18 sched_init...");
