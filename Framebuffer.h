@@ -256,4 +256,13 @@ void ui_draw_desktop(void);
  * Вызывать раз в секунду из таймерного тика. См. ui_extra.h/ui_tick(). */
 void ui_redraw_clock(void);
 
+/*
+ * ui_desktop_handle_mouse — обработка клика/наведения на элементы
+ * рабочего стола (кнопка Menu и всплывающее меню "Vykluchit"/"Perezagruzit").
+ * Вызывать на КАЖДОМ тике (перед отрисовкой курсора), с текущей позицией
+ * мыши и битовой маской кнопок (bit0 = ЛКМ).
+ * В FB_MODE_VGA — ничего не делает.
+ */
+void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons);
+
 #endif /* FRAMEBUFFER_H */

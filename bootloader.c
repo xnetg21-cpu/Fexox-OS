@@ -59,6 +59,25 @@ static EFI_GUID EFI_LOADED_IMAGE_PROTOCOL_GUID =
 static EFI_GUID EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID =
     {0x9042a9de, 0x23dc, 0x4a38, {0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a}};
 
+/* ACPI RSDP GUID'ы в EFI ConfigurationTable — нужны для поиска RSDP без
+ * сканирования памяти (на реальном железе RSDP не всегда лежит в
+ * "классическом" диапазоне 0xE0000-0xFFFFF, как в BIOS/QEMU). */
+static EFI_GUID EFI_ACPI_20_TABLE_GUID =
+    {0x8868e871, 0xe4f1, 0x11d3, {0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81}};
+static EFI_GUID EFI_ACPI_10_TABLE_GUID =
+    {0xeb9d2d30, 0x2d88, 0x11d3, {0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d}};
+
+typedef struct {
+    EFI_GUID VendorGuid;
+    void    *VendorTable;
+} EFI_CONFIGURATION_TABLE;
+
+static int efi_guid_eq(const EFI_GUID *a, const EFI_GUID *b) {
+    if (a->Data1 != b->Data1 || a->Data2 != b->Data2 || a->Data3 != b->Data3) return 0;
+    for (int i = 0; i < 8; i++) if (a->Data4[i] != b->Data4[i]) return 0;
+    return 1;
+}
+
 /* ---- GOP (Graphics Output Protocol) ---- */
 typedef enum {
     PixelRedGreenBlueReserved8BitPerColor,
@@ -217,6 +236,24 @@ typedef struct {
     UINTN NumberOfTableEntries; void *ConfigurationTable;
 } EFI_SYSTEM_TABLE;
 
+/* Ищем RSDP в EFI ConfigurationTable: сперва ACPI 2.0, затем ACPI 1.0 как
+ * фолбэк. Возвращает физический адрес RSDP или 0, если ACPI не найден
+ * (тогда ядро просто не сможет сделать "настоящий" ACPI shutdown/reboot
+ * и останется на старых фолбэках — не фатально).
+ * Определена здесь (а не сразу после GUID'ов), т.к. нужен уже готовый
+ * тип EFI_SYSTEM_TABLE. */
+static UINT64 efi_find_rsdp(EFI_SYSTEM_TABLE *SystemTable) {
+    EFI_CONFIGURATION_TABLE *cfg = (EFI_CONFIGURATION_TABLE *)SystemTable->ConfigurationTable;
+    void *rsdp10 = NULL;
+    for (UINTN i = 0; i < SystemTable->NumberOfTableEntries; i++) {
+        if (efi_guid_eq(&cfg[i].VendorGuid, &EFI_ACPI_20_TABLE_GUID))
+            return (UINT64)(UINTN)cfg[i].VendorTable;
+        if (efi_guid_eq(&cfg[i].VendorGuid, &EFI_ACPI_10_TABLE_GUID))
+            rsdp10 = cfg[i].VendorTable;
+    }
+    return (UINT64)(UINTN)rsdp10;
+}
+
 typedef struct PACKED {
     UINT8  e_ident[16]; UINT16 e_type; UINT16 e_machine; UINT32 e_version;
     UINT64 e_entry; UINT64 e_phoff; UINT64 e_shoff; UINT32 e_flags;
@@ -245,6 +282,7 @@ typedef struct PACKED {
     void    *gdt_ptr;
     void    *idt_ptr;
     fb_info_t fb;
+    UINT64  rsdp_phys;   /* физический адрес ACPI RSDP, 0 если не найден */
 } BOOT_INFO;
 
 #define BOOT_INFO_MAGIC 0x4B45524E454C424FULL
@@ -404,6 +442,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     BS->SetWatchdogTimer(0, 0, 0, NULL);
     bl_log(ConOut, "=== FEXOS Bootloader ===\r\n");
     DBG_MSG("BL", "01 ConOut ok");
+
+    /* RSDP берём из ConfigurationTable сразу, пока SystemTable точно валиден
+     * (это просто чтение массива, не boot-service вызов — безопасно делать
+     * и после ExitBootServices, но удобнее сохранить пораньше). */
+    UINT64 rsdp_phys = efi_find_rsdp(SystemTable);
+    DBG_VAL("BL", "01b rsdp_phys", rsdp_phys);
 
     EFI_MEMORY_DESCRIPTOR *MemoryMap = NULL;
     UINTN MemoryMapSize = 0, MapKey = 0, DescriptorSize = 0;
@@ -647,6 +691,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     g_boot_info.pml4_phys = pml4_phys;
     g_boot_info.gdt_ptr = NULL;
     g_boot_info.idt_ptr = NULL;
+    g_boot_info.rsdp_phys = rsdp_phys;
     /* g_boot_info.fb уже заполнена выше (до ExitBootServices) */
 
     UINT64 rsp = (UINT64)(UINTN)(bl_exit_stack + sizeof(bl_exit_stack));

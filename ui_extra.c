@@ -18,6 +18,9 @@ extern int     vfs_open(const char *path, int flags);
 extern int     vfs_close(int fd);
 extern int64_t vfs_read(int fd, void *buf, uint64_t size);
 
+/* --- из PS2Mouse.c --- */
+extern uint8_t ps2_mouse_buttons(void);
+
 #ifndef UI_O_RDONLY
 #define UI_O_RDONLY 0
 #endif
@@ -252,6 +255,10 @@ static void cursor_draw(int32_t x, int32_t y) {
  * ========================================================================= */
 void ui_tick(void) {
     if (fb_get_mode() != FB_MODE_LINEAR) return;
+
+    /* Клики/наведение на Menu и всплывающее меню — до отрисовки курсора,
+     * чтобы курсор не "затирал" только что перерисованные пункты меню. */
+    ui_desktop_handle_mouse(g_mouse_x, g_mouse_y, ps2_mouse_buttons());
 
     cursor_restore_bg();
     cursor_draw(g_mouse_x, g_mouse_y);

@@ -35,12 +35,14 @@ typedef struct __attribute__((packed)) {
     void    *gdt_ptr;
     void    *idt_ptr;
     fb_info_t fb;
+    uint64_t rsdp_phys;   /* физический адрес ACPI RSDP, 0 если не найден */
 } BOOT_INFO;
 
 #define BOOT_INFO_MAGIC 0x4B45524E454C424FULL
 
 extern int  mem_control_init(const void *efi_map, uint64_t map_size, uint64_t desc_size);
 extern int  interrupt_init(uint64_t ioapic_phys_addr, uint32_t timer_freq_hz);
+extern int  acpi_init(uint64_t rsdp_phys);
 extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
 
@@ -481,6 +483,17 @@ void kernel_entry(BOOT_INFO *info) {
     vga = VGA_VIRT;  /* vmm_activate уже случился внутри */
     kprint("[OK] memory\n");
     DBG_MSG("KR", "13 memory ok");
+
+    /* --- ACPI (для настоящего shutdown/reboot на реальном железе) ---
+     * Нужен активный DIRECT_MAP (уже есть после mem_control_init).
+     * Не фатально при ошибке — Menu Shutdown/Reboot тогда просто
+     * останутся на старых фолбэках (QEMU debug-порт / 8042 / triple fault). */
+    DBG_MSG("KR", "13a acpi_init...");
+    if (acpi_init(info->rsdp_phys) == 0) {
+        kprint("[OK] acpi\n");
+    } else {
+        kprint("[INFO] no ACPI (rsdp not found / parse failed)\n");
+    }
 
     /* --- Framebuffer --- */
     DBG_MSG("KR", "13b fb_init...");

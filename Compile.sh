@@ -35,6 +35,7 @@ $CC $CFLAGS_KERN -c Framebuffer.c      -o build/Framebuffer.o
 $CC $CFLAGS_KERN -c png.c              -o build/png.o
 $CC $CFLAGS_KERN -c ui_extra.c         -o build/ui_extra.o
 $CC $CFLAGS_KERN -c PS2Mouse.c         -o build/PS2Mouse.o
+$CC $CFLAGS_KERN -c AcpiControl.c      -o build/AcpiControl.o
 
 $LD_KERN $LDFLAGS_KERN -o build/kernel.bin \
     build/boot_stub.o      \
@@ -52,7 +53,8 @@ $LD_KERN $LDFLAGS_KERN -o build/kernel.bin \
     build/Framebuffer.o    \
     build/png.o            \
     build/ui_extra.o        \
-    build/PS2Mouse.o
+    build/PS2Mouse.o        \
+	build/AcpiControl.o
 
 echo "[*] Загрузчик UEFI..."
 $MGW $CFLAGS_BOOT -c bootloader.c -o build/bootloader.o

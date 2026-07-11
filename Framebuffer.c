@@ -12,6 +12,7 @@
 #include "Framebuffer.h"
 #include "png.h"
 #include "debug_out.h"
+#include "AcpiControl.h"
 
 /* =========================================================================
  * Внешние зависимости ядра
@@ -677,12 +678,29 @@ static inline int bcd_to_bin(uint8_t v) {
 }
 
 static void rtc_get_msk(int *out_h, int *out_m, int *out_s) {
-    int guard = 1000000;
-    while ((cmos_read(0x0A) & 0x80) && guard-- > 0) ;
+    /* Читаем ss/mm/hh ДВАЖДЫ и сравниваем. Если RTC начинает своё
+     * внутреннее обновление ровно между отдельными inb() (проверка UIP
+     * перед чтением не гарантирует атомарность всех трёх регистров разом),
+     * можно получить "рваный" набор — например старое hh + новое mm.
+     * На следующей секунде показания сами исправляются, что визуально
+     * выглядит как скачок часов сразу на 2 секунды. Двойное чтение с
+     * сверкой убирает эту гонку. */
+    uint8_t ss, mm, hh, ss2, mm2, hh2;
+    int guard;
+    do {
+        guard = 1000000;
+        while ((cmos_read(0x0A) & 0x80) && guard-- > 0) ;
+        ss = cmos_read(0x00);
+        mm = cmos_read(0x02);
+        hh = cmos_read(0x04);
 
-    uint8_t ss = cmos_read(0x00);
-    uint8_t mm = cmos_read(0x02);
-    uint8_t hh = cmos_read(0x04);
+        guard = 1000000;
+        while ((cmos_read(0x0A) & 0x80) && guard-- > 0) ;
+        ss2 = cmos_read(0x00);
+        mm2 = cmos_read(0x02);
+        hh2 = cmos_read(0x04);
+    } while (ss != ss2 || mm != mm2 || hh != hh2);
+
     uint8_t sb = cmos_read(0x0B);
 
     if (!(sb & 0x04)) {
@@ -717,14 +735,45 @@ static void fb_draw_digit2(int32_t x, int32_t y, int val,
 
 #define TASKBAR_H       48u
 #define TASKBAR_BG      0xD4D0C8U
-#define MENU_BTN_X      6
-#define MENU_BTN_W      64u
-#define MENU_BTN_H      36u
+#define MENU_BTN_X      0   /* вплотную к левому краю экрана — без зазора */
+#define MENU_BTN_W      76u     /* было 64 — чуть шире */
+#define MENU_BTN_H      40u     /* было 36 — чуть выше */
 #define MENU_BTN_BG     0xFFFAA0U
 #define MENU_BTN_FG     0x202020U
 #define WALLPAPER_COLOR 0x6C9FCEU
 #define CLOCK_FG        0x101010U
 #define CLOCK_BG        TASKBAR_BG
+
+/* =========================================================================
+ * Всплывающее меню "Menu" (Пуск) — Shutdown / Reboot
+ *
+ * Прикреплено вплотную к taskbar (без зазора) и к левому краю кнопки
+ * Menu. Панель светло-жёлтая (в цвет кнопки Menu), внутри две растянутые
+ * по ширине светлые кнопки; при наведении курсора кнопка под ним
+ * подсвечивается жёлтым.
+ *
+ * ВАЖНО: встроенный шрифт (g_font8x16) содержит только ASCII 0x20–0x7E,
+ * кириллицы в нём нет, поэтому подписи — транслит.
+ * ========================================================================= */
+#define MENU_POPUP_W        190u
+#define MENU_POPUP_H         98u
+#define MENU_POPUP_GAP        0   /* 0 — панель "прилеплена" вплотную к taskbar */
+#define MENU_POPUP_BG        0xFFFAA0U   /* светло-жёлтый, как кнопка Menu */
+#define MENU_POPUP_BORDER    0xC8B860U   /* тёплая рамка в тон панели */
+#define MENU_ITEM_W          (MENU_POPUP_W - 20u)
+#define MENU_ITEM_H           36u
+#define MENU_ITEM_GAP          8
+#define MENU_ITEM_BG          0xFFFCE8U  /* светлая (почти белая) кнопка */
+#define MENU_ITEM_BG_HOVER    0xFFE066U  /* жёлтая подсветка при наведении */
+#define MENU_ITEM_FG          0x202020U
+
+static bool       g_menu_open  = false;
+static int        g_menu_hover = -1;      /* -1 нет, 0 = Shutdown, 1 = Reboot */
+static uint8_t    g_prev_buttons = 0;
+static fb_color_t *g_menu_saved_bg = NULL;
+
+static void ui_system_shutdown(void);
+static void ui_system_reboot(void);
 
 /* =========================================================================
  * VFS
@@ -897,6 +946,199 @@ static void ui_draw_menu_button(int32_t panel_y) {
     int32_t tx = bx + (int32_t)(bw / 2u) - (int32_t)(4u * FB_FONT_W / 2u);
     int32_t ty = by + (int32_t)((bh - FB_FONT_H) / 2u);
     fb_draw_string(tx, ty, "Menu", MENU_BTN_FG, MENU_BTN_BG);
+}
+
+/* =========================================================================
+ * Всплывающее меню — геометрия, сохранение фона, отрисовка, клики
+ * ========================================================================= */
+static void menu_popup_rect(int32_t panel_y, int32_t *mx, int32_t *my) {
+    *mx = MENU_BTN_X;
+    *my = panel_y - (int32_t)MENU_POPUP_H - MENU_POPUP_GAP;
+    if (*my < 0) *my = 0;
+}
+
+static void menu_item_rect(int idx, int32_t mx, int32_t my,
+                            int32_t *ix, int32_t *iy, uint32_t *iw, uint32_t *ih) {
+    *ix = mx + 10;
+    *iy = my + 10 + idx * (int32_t)(MENU_ITEM_H + MENU_ITEM_GAP);
+    *iw = MENU_ITEM_W;
+    *ih = MENU_ITEM_H;
+}
+
+static bool point_in_rect(int32_t px, int32_t py,
+                           int32_t x, int32_t y, uint32_t w, uint32_t h) {
+    return px >= x && py >= y && px < x + (int32_t)w && py < y + (int32_t)h;
+}
+
+static void menu_save_bg(int32_t mx, int32_t my) {
+    if (!g_menu_saved_bg) {
+        g_menu_saved_bg = (fb_color_t *)kmalloc(
+            (uint64_t)MENU_POPUP_W * MENU_POPUP_H * sizeof(fb_color_t));
+    }
+    if (!g_menu_saved_bg) return;
+    for (uint32_t row = 0; row < MENU_POPUP_H; row++)
+        for (uint32_t col = 0; col < MENU_POPUP_W; col++)
+            g_menu_saved_bg[row * MENU_POPUP_W + col] =
+                fb_get_pixel(mx + (int32_t)col, my + (int32_t)row);
+}
+
+static void menu_restore_bg(int32_t mx, int32_t my) {
+    if (!g_menu_saved_bg) return;
+    for (uint32_t row = 0; row < MENU_POPUP_H; row++)
+        for (uint32_t col = 0; col < MENU_POPUP_W; col++)
+            fb_put_pixel(mx + (int32_t)col, my + (int32_t)row,
+                        g_menu_saved_bg[row * MENU_POPUP_W + col]);
+    fb_flip();
+}
+
+static void ui_draw_start_menu(int32_t panel_y) {
+    int32_t mx, my;
+    menu_popup_rect(panel_y, &mx, &my);
+
+    /* Панель: белая с лёгким серо-жёлтым оттенком + серая рамка */
+    fb_fill_rect(mx, my, MENU_POPUP_W, MENU_POPUP_H, MENU_POPUP_BG);
+    fb_draw_rect(mx, my, MENU_POPUP_W, MENU_POPUP_H, MENU_POPUP_BORDER, 1);
+
+    static const char *labels[2] = { "Shutdown", "Reboot" };
+
+    for (int i = 0; i < 2; i++) {
+        int32_t ix, iy; uint32_t iw, ih;
+        menu_item_rect(i, mx, my, &ix, &iy, &iw, &ih);
+
+        fb_color_t bg = (g_menu_hover == i) ? MENU_ITEM_BG_HOVER : MENU_ITEM_BG;
+        fb_fill_rect(ix, iy, iw, ih, bg);
+        fb_draw_rect(ix, iy, iw, ih, MENU_POPUP_BORDER, 1);
+
+        int32_t tw = (int32_t)fb_text_width(labels[i]);
+        int32_t tx = ix + (int32_t)((iw - (uint32_t)tw) / 2u);
+        int32_t ty = iy + (int32_t)((ih - FB_FONT_H) / 2u);
+        fb_draw_string(tx, ty, labels[i], MENU_ITEM_FG, bg);
+    }
+
+    fb_flip();
+}
+
+/*
+ * ui_desktop_handle_mouse — вызывать на каждом тике (из ui_tick, ДО
+ * перерисовки курсора) с текущей позицией мыши и состоянием кнопок.
+ * Открывает/закрывает Menu-меню по клику на кнопку Menu, подсвечивает
+ * пункты меню под курсором и обрабатывает клики по "Shutdown"/"Reboot".
+ */
+void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
+    if (g_fb.mode != FB_MODE_LINEAR) return;
+    if (!g_fb.width || !g_fb.height) return;
+
+    int32_t panel_y = (int32_t)((g_fb.height >= TASKBAR_H) ? g_fb.height - TASKBAR_H : 0);
+
+    bool left_now  = (buttons & 0x01) != 0;
+    bool left_was  = (g_prev_buttons & 0x01) != 0;
+    bool left_click = left_now && !left_was;   /* фронт нажатия */
+
+    /* Клик по кнопке Menu — открыть/закрыть меню */
+    int32_t mbx = MENU_BTN_X;
+    int32_t mby = panel_y + (int32_t)((TASKBAR_H - MENU_BTN_H) / 2);
+    if (left_click && point_in_rect(x, y, mbx, mby, MENU_BTN_W, MENU_BTN_H)) {
+        int32_t mx, my;
+        menu_popup_rect(panel_y, &mx, &my);
+        if (g_menu_open) {
+            menu_restore_bg(mx, my);
+            g_menu_open = false;
+        } else {
+            menu_save_bg(mx, my);
+            g_menu_open = true;
+            g_menu_hover = -1;
+            ui_draw_start_menu(panel_y);
+        }
+        g_prev_buttons = buttons;
+        return;
+    }
+
+    if (g_menu_open) {
+        int32_t mx, my;
+        menu_popup_rect(panel_y, &mx, &my);
+
+        int new_hover = -1;
+        for (int i = 0; i < 2; i++) {
+            int32_t ix, iy; uint32_t iw, ih;
+            menu_item_rect(i, mx, my, &ix, &iy, &iw, &ih);
+            if (point_in_rect(x, y, ix, iy, iw, ih)) { new_hover = i; break; }
+        }
+        if (new_hover != g_menu_hover) {
+            g_menu_hover = new_hover;
+            ui_draw_start_menu(panel_y);
+        }
+
+        if (left_click && new_hover >= 0) {
+            if (new_hover == 0) ui_system_shutdown();
+            else                ui_system_reboot();
+            /* не возвращаемся — на случай если shutdown/reboot не сработали
+             * (реальное железо без ACPI/8042), меню остаётся открытым */
+        } else if (left_click && new_hover < 0 &&
+                   !point_in_rect(x, y, mx, my, MENU_POPUP_W, MENU_POPUP_H)) {
+            /* клик мимо меню и мимо кнопки Menu — закрыть */
+            menu_restore_bg(mx, my);
+            g_menu_open = false;
+        }
+    }
+
+    g_prev_buttons = buttons;
+}
+
+/*
+ * ui_system_shutdown — выключение питания.
+ *
+ * Порядок попыток (каждая следующая — фолбэк, если предыдущая не сработала):
+ *   1. Настоящий ACPI S5 (AcpiControl.c: RSDP->FADT->\_S5, запись
+ *      SLP_TYP|SLP_EN в PM1_CNT) — работает и на реальном ПК, и в QEMU.
+ *   2. QEMU/Bochs debug shutdown-порт (0x604/0xB004) — на реальном железе
+ *      это просто запись в никуда, безвредно, но и бесполезно; оставлено
+ *      на случай сборки без ACPI-таблиц (например урезанный QEMU-профиль).
+ *   3. hlt-цикл — если вообще ничего не сработало, машина зависает,
+ *      а не продолжает работать с открытым меню.
+ */
+static void ui_system_shutdown(void) {
+    DBG_MSG("UI", "shutdown requested");
+
+    acpi_power_off();   /* при успехе сюда управление не возвращается */
+
+    DBG_MSG("UI", "shutdown: ACPI недоступен/не сработал, QEMU-фолбэк");
+    __asm__ volatile ("outw %0, %1" : : "a"((uint16_t)0x2000), "Nd"((uint16_t)0x604));
+    __asm__ volatile ("outw %0, %1" : : "a"((uint16_t)0x2000), "Nd"((uint16_t)0xB004));
+
+    for (;;) __asm__ volatile ("hlt");
+}
+
+/*
+ * ui_system_reboot — программная перезагрузка.
+ *
+ * Порядок попыток:
+ *   1. ACPI Reset Register (FADT, ACPI 2.0+) — самый надёжный способ на
+ *      современном реальном железе, официально документирован в ACPI spec.
+ *   2. Импульс RESET через контроллер клавиатуры 8042 (команда 0xFE в
+ *      порт 0x64) — классика, работает почти на всём железе с i8042
+ *      (и в QEMU), но на некоторых чипсетах без i8042 (USB-only,
+ *      "legacy-free") не срабатывает.
+ *   3. Triple fault (lidt с limit=0 + программное исключение) — работает
+ *      абсолютно всегда на x86, это последний гарантированный фолбэк.
+ */
+static void ui_system_reboot(void) {
+    DBG_MSG("UI", "reboot requested");
+
+    acpi_reset();        /* при успехе сюда управление не возвращается */
+
+    DBG_MSG("UI", "reboot: ACPI reset недоступен, 8042-фолбэк");
+    for (int i = 0; i < 100; i++) {
+        uint8_t status;
+        __asm__ volatile ("inb %1, %0" : "=a"(status) : "Nd"((uint16_t)0x64));
+        if (!(status & 0x02)) break;
+    }
+    __asm__ volatile ("outb %0, %1" : : "a"((uint8_t)0xFE), "Nd"((uint16_t)0x64));
+
+    /* Даём 8042 немного времени сработать, прежде чем идти на triple fault */
+    for (volatile uint32_t i = 0; i < 10000000u; i++) { }
+
+    DBG_MSG("UI", "reboot: 8042 не сработал, triple fault");
+    cpu_triple_fault_reset();   /* никогда не возвращается */
 }
 
 /* =========================================================================
