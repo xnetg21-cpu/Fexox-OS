@@ -9,7 +9,7 @@ command -v $CC >/dev/null || { echo "[!] clang не найден"; exit 1; }
 
 mkdir -p build
 
-CFLAGS_KERN="-I. -target x86_64-unknown-none-elf -ffreestanding -fno-builtin -mno-red-zone -mcmodel=kernel -fno-pie -fno-stack-protector -mgeneral-regs-only -O0 -g -Wall -Wextra -std=c11"
+CFLAGS_KERN="-I. -IResources -target x86_64-unknown-none-elf -ffreestanding -fno-builtin -mno-red-zone -mcmodel=kernel -fno-pie -fno-stack-protector -mgeneral-regs-only -O0 -g -Wall -Wextra -std=c11"
 LDFLAGS_KERN="-m elf_x86_64 -nostdlib -T kernel.ld"
 
 MGW="x86_64-w64-mingw32-gcc"
@@ -36,6 +36,7 @@ $CC $CFLAGS_KERN -c png.c              -o build/png.o
 $CC $CFLAGS_KERN -c ui_extra.c         -o build/ui_extra.o
 $CC $CFLAGS_KERN -c PS2Mouse.c         -o build/PS2Mouse.o
 $CC $CFLAGS_KERN -c AcpiControl.c      -o build/AcpiControl.o
+$CC $CFLAGS_KERN -c Resources/fxapp.c  -o build/fxapp.o
 
 $LD_KERN $LDFLAGS_KERN -o build/kernel.bin \
     build/boot_stub.o      \
@@ -54,7 +55,8 @@ $LD_KERN $LDFLAGS_KERN -o build/kernel.bin \
     build/png.o            \
     build/ui_extra.o        \
     build/PS2Mouse.o        \
-	build/AcpiControl.o
+	build/AcpiControl.o     \
+	build/fxapp.o
 
 echo "[*] Загрузчик UEFI..."
 $MGW $CFLAGS_BOOT -c bootloader.c -o build/bootloader.o
@@ -99,7 +101,7 @@ if command -v mformat >/dev/null; then
 
     echo "[OK] build/data.img готов"
 
-    # UI ресурсы (обои, курсор и т.п.)
+    # UI ресурсы (обои, курсор, MyPC.png, close.png и т.п.)
     if [ -d "UI" ]; then
         echo "[*] Добавляем папку UI/ на data.img..."
         mmd -i build/data.img ::UI 2>/dev/null || true
@@ -110,6 +112,21 @@ if command -v mformat >/dev/null; then
         done
     else
         echo "[!] Папка UI/ не найдена рядом со скриптом — обои/курсор не будут скопированы"
+    fi
+
+    # APPS/ — манифесты .fxapp (см. Resources/fxapp.h/Resources/fxapp.c).
+    # Необязательно: если папки нет или манифеста для конкретной иконки
+    # нет — ядро использует значения по умолчанию (жёстко заданное имя/иконка).
+    if [ -d "APPS" ]; then
+        echo "[*] Добавляем папку APPS/ на data.img..."
+        mmd -i build/data.img ::APPS 2>/dev/null || true
+        for f in APPS/*; do
+            [ -f "$f" ] || continue
+            mcopy -i build/data.img "$f" "::APPS/$(basename "$f")"
+            echo "[OK] $f -> ::APPS/$(basename "$f")"
+        done
+    else
+        echo "[!] Папка APPS/ не найдена — .fxapp манифесты не будут скопированы (не критично)"
     fi
 else
     echo "[!] mtools нет — pacman -S mingw-w64-ucrt-x86_64-mtools"

@@ -10,7 +10,12 @@
  *                ftruncate, fcntl
  *   Прочее     : arch_prctl (SET_FS/GET_FS), pipe,
  *                shm_get, shm_at, shm_detach
- *   Заглушки   : get_framebuffer (возвращает VGA 0xB8000, 80x25 text)
+ *   Графика    : get_framebuffer (реальный GOP linear framebuffer, если
+ *                экран уже в linear-режиме; VGA text 0xB8000 fallback
+ *                иначе), win_create/win_close/win_move (тонкая обёртка
+ *                над оконным менеджером Framebuffer.c — то же самое
+ *                окно+кнопка на панели задач, что и у встроенных в
+ *                ядро приложений, например "My Computer")
  *
  * Зависимости:
  *   MemoryControl : kmalloc/kfree, pmm_alloc_frames/pmm_free_frames,
@@ -42,6 +47,22 @@ extern "C" {
  * ========================================================================= */
 extern void    *kmalloc(size_t size);
 extern void     kfree(void *ptr);
+
+/* --- Framebuffer.c: реальный GOP framebuffer + оконный менеджер ---
+ * (нет общего Framebuffer.h-инклюда в остальных модулях ядра — см.
+ * аналогичный паттерн внешних extern'ов в PS2Mouse.c/ui_extra.c/fxapp.c). */
+extern int      fb_get_mode(void);
+extern uint32_t fb_width(void);
+extern uint32_t fb_height(void);
+extern uint64_t fb_phys_addr(void);
+extern uint32_t fb_pitch(void);
+extern uint8_t  fb_bpp(void);
+#define FB_MODE_LINEAR_ 2   /* совпадает с FB_MODE_LINEAR из Framebuffer.h */
+
+extern int  ui_win_create(const char *title, uint32_t w, uint32_t h, int32_t owner_pid);
+extern int  ui_win_close(int win_id);
+extern int  ui_win_move(int win_id, int32_t x, int32_t y);
+extern void ui_win_close_all_owned_by(int32_t owner_pid);
 extern uint64_t pmm_alloc_frames(size_t count, size_t align);
 extern void     pmm_free_frames(uint64_t pa, size_t count);
 extern int      vmm_map_user(uint64_t va, uint64_t pa, bool rw, bool exec);
@@ -67,6 +88,26 @@ extern int    strncmp(const char *a, const char *b, size_t n);
 
 /* Граница user virtual address space */
 #define USER_VIRT_LIMIT     0x00007FFFFFFFFFFFULL
+
+/* =========================================================================
+ * Оконные системные вызовы — номера.
+ *
+ * ВАЖНО: определены здесь через #ifndef, чтобы не конфликтовать, если
+ * они уже объявлены в Syscall.h. Правильное место для них — Syscall.h
+ * (вместе с остальными SYS_*), рядом с SYS_GET_FRAMEBUFFER; секцию ниже
+ * стоит перенести туда же при следующей правке заголовка, а также
+ * продублировать в userspace libc-заголовке syscall-номеров, которым
+ * пользуются .fxapp/ELF-приложения.
+ * ========================================================================= */
+#ifndef SYS_WIN_CREATE
+#define SYS_WIN_CREATE   600
+#endif
+#ifndef SYS_WIN_CLOSE
+#define SYS_WIN_CLOSE    601
+#endif
+#ifndef SYS_WIN_MOVE
+#define SYS_WIN_MOVE     602
+#endif
 
 /* Heap растёт вверх от этой базы (per-process в реальном ядре — здесь глобально) */
 #define USER_HEAP_BASE      0x0000000010000000ULL
@@ -220,6 +261,10 @@ static int64_t sc_copy_string(const char *user_ptr, char *kbuf, size_t kbuf_size
  * ----------------------------------------------------------------------- */
 static int64_t sc_exit(uint64_t code) {
     DBG_VAL("SC", "sys_exit code", code);
+
+    task_t *t = sched_current();
+    if (t) ui_win_close_all_owned_by((int32_t)t->tid);
+
     sched_exit();            /* не возвращается */
     __builtin_unreachable();
 }
@@ -1204,10 +1249,18 @@ static int64_t sc_shm_detach(uint64_t va, uint64_t shm_idx_arg) {
 }
 
 /* -----------------------------------------------------------------------
- * sys_get_framebuffer (500) — ЗАГЛУШКА для VGA текстового режима.
+ * sys_get_framebuffer (500)
  *
- * Возвращает информацию о VGA text buffer (0xB8000).
- * Когда будет GOP/linear framebuffer — заменить phys_addr и mode.
+ * Возвращает реальный GOP linear framebuffer (см. Framebuffer.c: g_fb),
+ * если экран инициализирован в FB_MODE_LINEAR — то есть настоящие
+ * width/height/pitch/bpp и физический адрес буфера. Именно это нужно
+ * userspace-приложениям (в т.ч. будущему полноценному My Computer.elf),
+ * чтобы рисовать напрямую в кадр через собственный mmap физического
+ * адреса (sc_mmap с MAP_PHYS/аналогом — см. память ниже).
+ *
+ * Если экран не в linear-режиме (например ещё не инициализирован, или
+ * GOP недоступен) — отдаём VGA text buffer (0xB8000, 80x25) как и раньше,
+ * чтобы вызывающий код (например ранний init) не падал.
  *
  * a1 = sc_framebuffer_t* (из user space)
  * ----------------------------------------------------------------------- */
@@ -1217,6 +1270,25 @@ static int64_t sc_get_framebuffer(uint64_t fb_ptr) {
 
     sc_framebuffer_t *fb = (sc_framebuffer_t *)(uintptr_t)fb_ptr;
 
+    if (fb_get_mode() == FB_MODE_LINEAR_ && fb_phys_addr() != 0) {
+        fb->phys_addr = fb_phys_addr();
+        /* virt_addr — DIRECT_MAP-адрес того же физического буфера в
+         * адресном пространстве ЯДРА; userspace всё равно должен сам
+         * замаппить fb->phys_addr к себе через sc_mmap (физический
+         * маппинг), поэтому здесь достаточно продублировать phys_addr —
+         * значение поля "для справки", не для прямого разыменования
+         * из userspace. */
+        fb->virt_addr = fb_phys_addr();
+        fb->width     = fb_width();
+        fb->height    = fb_height();
+        fb->pitch     = fb_pitch();
+        fb->bpp       = fb_bpp();
+        fb->mode      = 1;   /* 1 = linear GOP framebuffer */
+
+        DBG_MSG("SC", "sys_get_framebuffer: linear GOP");
+        return 0;
+    }
+
     fb->phys_addr = VGA_TEXT_PHYS;
     fb->virt_addr = VGA_TEXT_PHYS;  /* у нас identity-маппинг для VGA через DIRECT_MAP */
     fb->width     = VGA_TEXT_COLS;
@@ -1225,7 +1297,64 @@ static int64_t sc_get_framebuffer(uint64_t fb_ptr) {
     fb->bpp       = 4;                  /* VGA text: 4 bpp (2 байта: char + attr) */
     fb->mode      = 0;                  /* 0 = VGA text mode 80x25 */
 
-    DBG_MSG("SC", "sys_get_framebuffer: VGA stub");
+    DBG_MSG("SC", "sys_get_framebuffer: VGA fallback (linear FB не готов)");
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * Оконные системные вызовы — тонкая обёртка над генерическим оконным
+ * менеджером из Framebuffer.c (ui_win_create/ui_win_close/ui_win_move).
+ * Это тот же самый код, которым ядро пользуется для своих встроенных
+ * окон (например "My Computer" — см. Framebuffer.c), так что любое
+ * userspace-приложение открывает окно и получает кнопку на панели
+ * задач ровно так же, как встроенные приложения ядра.
+ *
+ * sys_win_create (a1 = title_ptr, a2 = title_len, a3 = w, a4 = h)
+ *   Возвращает win_id (>=0) или -EFAULT/-EINVAL.
+ * sys_win_close  (a1 = win_id)
+ * sys_win_move   (a1 = win_id, a2 = x, a3 = y)
+ * ----------------------------------------------------------------------- */
+#define UI_WIN_TITLE_MAX_SC   64
+
+static int64_t sc_win_create(uint64_t title_ptr, uint64_t title_len,
+                             uint64_t w, uint64_t h) {
+    if (title_len == 0 || title_len >= UI_WIN_TITLE_MAX_SC)
+        title_len = UI_WIN_TITLE_MAX_SC - 1;
+
+    if (!syscall_validate_ptr((void *)(uintptr_t)title_ptr, (size_t)title_len))
+        return -(int64_t)EFAULT;
+
+    if (w == 0 || h == 0 || w > 4096 || h > 4096)
+        return -(int64_t)EINVAL;
+
+    char title[UI_WIN_TITLE_MAX_SC];
+    const char *src = (const char *)(uintptr_t)title_ptr;
+    size_t n = 0;
+    while (n < title_len && src[n] != '\0') { title[n] = src[n]; n++; }
+    title[n] = '\0';
+
+    task_t *cur = sched_current();
+    int32_t owner_pid = cur ? (int32_t)cur->tid : -1;
+
+    int id = ui_win_create(title, (uint32_t)w, (uint32_t)h, owner_pid);
+    if (id < 0) {
+        DBG_MSG("SC", "sys_win_create: не удалось создать окно (нет слотов?)");
+        return -(int64_t)ENOMEM;
+    }
+
+    DBG_VAL("SC", "sys_win_create: id", (uint64_t)id);
+    return (int64_t)id;
+}
+
+static int64_t sc_win_close(uint64_t win_id) {
+    if (ui_win_close((int)win_id) != 0)
+        return -(int64_t)EINVAL;
+    return 0;
+}
+
+static int64_t sc_win_move(uint64_t win_id, uint64_t x, uint64_t y) {
+    if (ui_win_move((int)win_id, (int32_t)x, (int32_t)y) != 0)
+        return -(int64_t)EINVAL;
     return 0;
 }
 
@@ -1276,6 +1405,9 @@ int64_t syscall_dispatch(uint64_t nr,
     case SYS_SHM_DETACH:    return sc_shm_detach(a1, a2);
     /* --- Графика --- */
     case SYS_GET_FRAMEBUFFER: return sc_get_framebuffer(a1);
+    case SYS_WIN_CREATE:      return sc_win_create(a1, a2, a3, a4);
+    case SYS_WIN_CLOSE:       return sc_win_close(a1);
+    case SYS_WIN_MOVE:        return sc_win_move(a1, a2, a3);
     default:
         DBG_VAL("SC", "unknown syscall", nr);
         return -(int64_t)ENOSYS;
