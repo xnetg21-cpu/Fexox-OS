@@ -114,9 +114,26 @@ static inline void kstr_cpy(char *dst, const char *src, int max) {
 }
 
 /* Spinlock (UP: cli/sti) */
-typedef volatile int spinlock_t;
-static inline void spin_lock(spinlock_t *l)   { (void)l; __asm__ volatile("cli":::"memory"); }
-static inline void spin_unlock(spinlock_t *l) { (void)l; __asm__ volatile("sti":::"memory"); }
+/* ВАЖНО: обычный cli/sti НЕ вкладывается. Если код уже держит секцию
+ * закрытой (cli) на более высоком уровне (например, fm_reset()/
+ * fm_handle_click() в Framebuffer.c — весь блокирующий I/O там должен
+ * быть неделим относительно таймера целиком, а не только на уровне
+ * одного сектора), а blkdev_read() внутри голым "sti" её преждевременно
+ * открывает — внешняя защита ломается ровно в середине операции.
+ * Поэтому спинлок сохраняет/восстанавливает реальный флаг IF (через
+ * pushfq/popfq), а не слепо гасит/включает прерывания: spin_unlock()
+ * возвращает IF в то состояние, в котором его застал ПАРНЫЙ spin_lock(),
+ * так что вложенные lock/unlock корректно составляются. */
+typedef volatile uint64_t spinlock_t;
+static inline void spin_lock(spinlock_t *l) {
+    uint64_t flags;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    *l = flags;
+}
+static inline void spin_unlock(spinlock_t *l) {
+    uint64_t flags = *l;
+    __asm__ volatile ("push %0; popfq" :: "r"(flags) : "memory", "cc");
+}
 
 /* =========================================================================
  * PCI утилиты (config space через IO ports 0xCF8/0xCFC)
@@ -235,10 +252,27 @@ blkdev_t *blkdev_find(const char *name) {
     return NULL;
 }
 
+/* ВАЖНО: read_sectors/write_sectors (virtio-blk и т.п.) ждут завершения
+ * запроса busy-wait поллингом used->idx (см. VBK-драйвер ниже, там же
+ * таймаут в 50 000 000 spin-итераций как аварийный выход). Это чтение
+ * может вызываться из кода, который сам исполняется внутри таймерного
+ * прерывания (например, клик по "My Computer" -> vfs_readdir ->
+ * read_cluster -> blkdev_read, см. Framebuffer.c/fm_handle_click).
+ * Если во время этого поллинга случится ещё одно таймерное прерывание
+ * (или переключение задачи планировщиком), обработчик тика/мыши
+ * вызовется повторно ДО того как текущее чтение диска завершится —
+ * это и есть источник "click ignored (reentrant, I/O in progress)"
+ * в логах UI. cli/sti здесь — не про SMP-безопасность (ядро
+ * однопроцессорное), а именно про то, чтобы сам факт чтения сектора
+ * был неделим относительно таймера: пока диск не ответил, ничего
+ * больше не должно прерывать текущий поток выполнения. */
 int blkdev_read(blkdev_t *dev, uint64_t lba, uint32_t count, void *buf) {
     if (!dev || !dev->ops || !dev->ops->read_sectors)
         return VFS_ERR_INVAL;
-    return dev->ops->read_sectors(dev, lba, count, buf);
+    spin_lock(&g_blk_lock);
+    int rc = dev->ops->read_sectors(dev, lba, count, buf);
+    spin_unlock(&g_blk_lock);
+    return rc;
 }
 
 int blkdev_write(blkdev_t *dev, uint64_t lba, uint32_t count, const void *buf) {
@@ -246,7 +280,10 @@ int blkdev_write(blkdev_t *dev, uint64_t lba, uint32_t count, const void *buf) {
         return VFS_ERR_INVAL;
     if (dev->readonly)
         return VFS_ERR_ROFS;
-    return dev->ops->write_sectors(dev, lba, count, buf);
+    spin_lock(&g_blk_lock);
+    int rc = dev->ops->write_sectors(dev, lba, count, buf);
+    spin_unlock(&g_blk_lock);
+    return rc;
 }
 
 /* =========================================================================
@@ -1005,6 +1042,31 @@ int vfs_umount(const char *path) {
     }
     spin_unlock(&g_mount_lock);
     return VFS_ERR_NOENT;
+}
+
+/* Сколько дисков сейчас смонтировано — используется UI ("Мой компьютер")
+ * чтобы нарисовать иконку для каждого реального диска/раздела и того
+ * диска, с которого запущена QEMU (он тоже просто ещё одна точка
+ * монтирования в этой же таблице). */
+int vfs_mount_count(void) {
+    return g_mount_count;
+}
+
+/* Путь монтирования и имя блочного устройства для диска idx.
+ * false — idx вне диапазона (g_mount_count мог измениться между
+ * вызовами vfs_mount_count и vfs_mount_info, вызывающий код должен
+ * быть готов к этому). */
+bool vfs_mount_info(int idx, char *path_out, size_t path_sz,
+                    char *dev_out, size_t dev_sz) {
+    if (idx < 0 || idx >= g_mount_count) return false;
+    vfs_mount_t *mnt = &g_mounts[idx];
+
+    if (path_out && path_sz > 0) kstr_cpy(path_out, mnt->path, (int)path_sz);
+    if (dev_out && dev_sz > 0) {
+        if (mnt->dev) kstr_cpy(dev_out, mnt->dev->name, (int)dev_sz);
+        else          dev_out[0] = '\0';
+    }
+    return true;
 }
 
 /* -------------------------------------------------------------------------

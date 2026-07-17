@@ -26,6 +26,8 @@ extern void  kfree(void *ptr);
 extern size_t strlcpy(char *dst, const char *src, size_t n);
 extern char  *strncat(char *dst, const char *src, size_t n);
 extern size_t strlen(const char *s);
+extern int    strcmp(const char *a, const char *b);
+extern char  *strrchr(const char *s, int c);
 
 /* DIRECT_MAP_OFFSET из MemoryControl.c:
    физический адрес pa → виртуальный = pa + DIRECT_MAP_OFFSET */
@@ -823,8 +825,9 @@ static void ui_system_reboot(void);
 #define FXAPP_ICON_FILE_MAXSZ  (256u * 1024u)
 
 #define FXAPP_WIN_CLOSE_SZ     20u    /* размер close.png — общий для всех окон */
-#define FXAPP_WIN_W           240u    /* размер окна "My Computer" (почти квадрат) */
-#define FXAPP_WIN_H           220u    /* включая заголовок */
+#define FXAPP_WIN_W           320u    /* размер окна "My Computer" — увеличено под
+                                        * сетку иконок дисков/папок/файлов (см. ниже) */
+#define FXAPP_WIN_H           280u    /* включая заголовок */
 /* Остальная геометрия/цвета окна теперь общие для ВСЕХ окон —
  * см. UI_WIN_TITLEBAR_H / UI_WIN_CLOSE_SZ / UI_WIN_*_BG в блоке
  * генерического оконного менеджера ниже. */
@@ -901,14 +904,33 @@ static void ui_taskbar_app_btn_rect(int slot_idx, int32_t panel_y,
 
 /* =========================================================================
  * VFS
+ *
+ * Файловый браузер окна "My Computer" (см. ниже) читает директории и
+ * список смонтированных дисков, поэтому вместо точечных extern-объявлений
+ * подключаем VFS.h целиком — там же vfs_dirent_t/VFS_TYPE_DIR/O_DIRECTORY
+ * и новые vfs_mount_count()/vfs_mount_info().
  * ========================================================================= */
-extern int     vfs_open(const char *path, int flags);
-extern int     vfs_close(int fd);
-extern int64_t vfs_read(int fd, void *buf, uint64_t size);
-extern int64_t vfs_seek(int fd, int64_t offset, int whence);
+#include "VFS.h"
+
+/* См. fm_reset()/fm_handle_click() ниже: блокирующая загрузка с диска
+ * (иконки + перечисление дисков/директорий) должна быть неделима
+ * относительно таймерного прерывания. Флага g_fm_busy одного
+ * недостаточно — он лишь отбрасывает постфактум уже случившийся
+ * вложенный вызов, но пока interrupts включены, такой вложенный вызов
+ * всё равно происходит (и в лучшем случае просто игнорируется, а
+ * fm_draw() после него всё равно рисует ещё не заполненное состояние).
+ * cli()/sti() гарантируют, что таймер физически не прервёт весь блок. */
+static inline uint64_t fm_io_cli(void) {
+    uint64_t flags;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+static inline void fm_io_sti(uint64_t flags) {
+    __asm__ volatile ("push %0; popfq" :: "r"(flags) : "memory", "cc");
+}
 
 #ifndef UI_O_RDONLY
-#  define UI_O_RDONLY 0
+#  define UI_O_RDONLY O_RDONLY
 #endif
 
 /* =========================================================================
@@ -1364,6 +1386,391 @@ static void fxapp_draw_icon(bool hovered) {
 }
 
 /* =========================================================================
+ * "My Computer" — содержимое окна: список дисков сверху (иконки disk.png,
+ * одна на каждую точку монтирования VFS — то есть и на реальные разделы,
+ * и на диск, с которого запущен QEMU: он для VFS ничем не отличается от
+ * любого другого смонтированного blkdev), а по клику на диск — список
+ * папок/файлов внутри (folder.png / file.png), с именем под каждой
+ * иконкой. Клик по папке заходит в неё; пункт ".." поднимается наверх,
+ * а с корня диска возвращает к списку дисков. Если смотреть не на что —
+ * рисуется надпись (шрифт без кириллицы, поэтому по-английски).
+ * ========================================================================= */
+#define FM_ICON_W        32u
+#define FM_ICON_H        32u
+#define FM_CELL_W          72   /* ширина ячейки сетки (иконка + отступы) */
+#define FM_CELL_H          56   /* высота ячейки (иконка 32 + зазор + подпись) */
+#define FM_GRID_PAD          8  /* отступ сетки от краёв тела окна */
+#define FM_PATH_MAX        256
+#define FM_MAX_ENTRIES      32  /* больше и не влезет в окно без скролла */
+#define FM_LABEL_MAX_CH      8  /* символов имени под иконкой (шрифт 8px/симв) */
+
+typedef enum {
+    FM_KIND_DRIVE = 0,   /* точка монтирования — диск */
+    FM_KIND_DIR,         /* поддиректория */
+    FM_KIND_FILE,        /* обычный файл */
+    FM_KIND_UP,          /* синтетический пункт "выше на уровень" */
+} fm_kind_t;
+
+typedef struct {
+    fm_kind_t kind;
+    char      label[VFS_MAX_NAME + 1];   /* имя файла/папки или диска для подписи */
+    char      drive_path[FM_PATH_MAX];   /* только для FM_KIND_DRIVE: путь монтирования */
+} fm_entry_t;
+
+typedef enum { FM_VIEW_DRIVES, FM_VIEW_DIR } fm_view_t;
+
+static fm_view_t   g_fm_view       = FM_VIEW_DRIVES;
+static char        g_fm_cur_path[FM_PATH_MAX]   = "/";
+static char        g_fm_drive_root[FM_PATH_MAX] = "/";  /* корень текущего диска —
+                                                          * подниматься выше некуда,
+                                                          * дальше только к списку дисков */
+static fm_entry_t  g_fm_entries[FM_MAX_ENTRIES];
+static int         g_fm_entry_count = 0;
+
+static png_image_t g_fm_icon_disk;    static int g_fm_icon_disk_loaded   = 0;
+static png_image_t g_fm_icon_folder;  static int g_fm_icon_folder_loaded = 0;
+static png_image_t g_fm_icon_file;    static int g_fm_icon_file_loaded   = 0;
+
+/* Собрать child = base + "/" + name (без двойных слешей, если base уже
+ * заканчивается на "/" — как корень "/"). */
+static void fm_path_join(const char *base, const char *name, char *out, size_t out_sz) {
+    strlcpy(out, base, out_sz);
+    size_t n = strlen(out);
+    if (n == 0 || out[n - 1] != '/') {
+        if (n + 1 < out_sz) { out[n] = '/'; out[n + 1] = '\0'; }
+    }
+    size_t cur = strlen(out);
+    if (cur < out_sz) strncat(out, name, out_sz - cur - 1);
+}
+
+/* Подняться на один уровень выше по path (in-place). "/" остаётся "/". */
+static void fm_path_up(char *path) {
+    size_t n = strlen(path);
+    while (n > 1 && path[n - 1] == '/') path[--n] = '\0';
+    char *slash = strrchr(path, '/');
+    if (!slash) { path[0] = '/'; path[1] = '\0'; return; }
+    if (slash == path) { path[1] = '\0'; return; }   /* дошли до корня диска */
+    *slash = '\0';
+}
+
+/* Грузим disk.png/folder.png/file.png один раз (как MyPC.png/close.png —
+ * см. fxapp_ensure_assets_loaded выше); используем тот же
+ * fxapp_load_png_asset (UI/<name>).
+ *
+ * ВАЖНО: флаг "готово" (ok) выставляется ТОЛЬКО если ВСЕ три иконки
+ * загрузились успешно. Раньше флаг "tried" выставлялся ДО попытки
+ * загрузки и больше никогда не сбрасывался — если самая первая
+ * попытка (например, во время гонки при первом открытии окна, см.
+ * fm_reset/g_fm_busy) не успевала прочитать файл, соответствующая
+ * иконка навсегда оставалась fallback'ом ("D"/"F"/"^") при всех
+ * последующих открытиях "My Computer", хотя файл в UI/ реально есть. */
+static void fm_ensure_assets_loaded(void) {
+    static bool ok = false;
+    if (ok) return;
+
+    bool all_ok = true;
+
+    if (!g_fm_icon_disk_loaded) {
+        g_fm_icon_disk.pixels = NULL;
+        if (fxapp_load_png_asset("disk.png", FM_ICON_W, FM_ICON_H, &g_fm_icon_disk))
+            g_fm_icon_disk_loaded = 1;
+        else
+            all_ok = false;
+    }
+
+    if (!g_fm_icon_folder_loaded) {
+        g_fm_icon_folder.pixels = NULL;
+        if (fxapp_load_png_asset("folder.png", FM_ICON_W, FM_ICON_H, &g_fm_icon_folder))
+            g_fm_icon_folder_loaded = 1;
+        else
+            all_ok = false;
+    }
+
+    if (!g_fm_icon_file_loaded) {
+        g_fm_icon_file.pixels = NULL;
+        if (fxapp_load_png_asset("file.png", FM_ICON_W, FM_ICON_H, &g_fm_icon_file))
+            g_fm_icon_file_loaded = 1;
+        else
+            all_ok = false;
+    }
+
+    /* Повторим попытку при следующем открытии окна, если что-то
+     * не загрузилось — только полный успех "закрывает" повтор. */
+    if (all_ok) ok = true;
+}
+
+/* Список дисков — один пункт на каждую точку монтирования VFS. */
+static void fm_reload_drives(void) {
+    g_fm_entry_count = 0;
+
+    int n = vfs_mount_count();
+    for (int i = 0; i < n && g_fm_entry_count < FM_MAX_ENTRIES; i++) {
+        char path[FM_PATH_MAX];
+        char dev[32];
+        if (!vfs_mount_info(i, path, sizeof(path), dev, sizeof(dev))) continue;
+
+        fm_entry_t *e = &g_fm_entries[g_fm_entry_count++];
+        e->kind = FM_KIND_DRIVE;
+        strlcpy(e->drive_path, path, sizeof(e->drive_path));
+        /* Подпись — имя блочного устройства ("vda" и т.п.); если вдруг
+         * пусто, покажем хотя бы путь монтирования. */
+        strlcpy(e->label, dev[0] ? dev : path, sizeof(e->label));
+    }
+    DBG_VAL("FXA", "my computer: drives found", (uint64_t)g_fm_entry_count);
+}
+
+/* Содержимое директории path на текущем диске: сначала пункт "..",
+ * затем все файлы/папки через vfs_readdir. */
+static void fm_reload_dir(const char *path) {
+    g_fm_entry_count = 0;
+
+    if (g_fm_entry_count < FM_MAX_ENTRIES) {
+        fm_entry_t *up = &g_fm_entries[g_fm_entry_count++];
+        up->kind = FM_KIND_UP;
+        strlcpy(up->label, "..", sizeof(up->label));
+    }
+
+    int fd = vfs_open(path, O_DIRECTORY);
+    if (fd < 0) {
+        DBG_VAL("FXA", "my computer: vfs_open(dir) failed, rc", (uint64_t)(int64_t)fd);
+        return;
+    }
+
+    for (uint32_t idx = 0; g_fm_entry_count < FM_MAX_ENTRIES; idx++) {
+        vfs_dirent_t de;
+        if (vfs_readdir(fd, idx, &de) != VFS_OK) break;
+
+        fm_entry_t *e = &g_fm_entries[g_fm_entry_count++];
+        e->kind = (de.type == VFS_TYPE_DIR) ? FM_KIND_DIR : FM_KIND_FILE;
+        strlcpy(e->label, de.name, sizeof(e->label));
+    }
+    vfs_close(fd);
+    DBG_VAL("FXA", "my computer: dir entries", (uint64_t)g_fm_entry_count);
+}
+
+/* Общий guard от реентрантности для ВСЕГО модуля "My Computer" —
+ * и для открытия иконки (fm_reset, ниже), и для клика внутри окна
+ * (fm_handle_click). Раньше guard был только в fm_handle_click;
+ * fm_reset() дергает ровно такой же блокирующий дисковый I/O
+ * (fm_ensure_assets_loaded читает 3 PNG, fm_reload_drives читает
+ * точки монтирования и пишет в g_fm_entries/g_fm_entry_count), но
+ * был совершенно не защищён — таймерный тик, повторно вызванный
+ * ДО завершения этого I/O (см. комментарий в fm_handle_click),
+ * мог застать g_fm_entries на середине заполнения. Это и было
+ * причиной "No Disks" при самом первом открытии окна. Один общий
+ * флаг на оба пути гарантирует, что они не могут пересечься. */
+static volatile bool g_fm_busy = false;
+
+/* Вызывается при каждом открытии окна "My Computer" — сбрасывает
+ * навигацию обратно на список дисков. */
+static void fm_reset(void) {
+    if (g_fm_busy) {
+        DBG_MSG("FXA", "my computer: reset ignored (reentrant, I/O in progress)");
+        return;
+    }
+    g_fm_busy = true;
+    uint64_t fm_flags = fm_io_cli();
+
+    g_fm_view = FM_VIEW_DRIVES;
+    strlcpy(g_fm_cur_path,   "/", sizeof(g_fm_cur_path));
+    strlcpy(g_fm_drive_root, "/", sizeof(g_fm_drive_root));
+    fm_ensure_assets_loaded();
+    fm_reload_drives();
+
+    fm_io_sti(fm_flags);
+    g_fm_busy = false;
+}
+
+static int fm_cols(uint32_t content_w) {
+    int c = (int)((content_w - 2u * FM_GRID_PAD) / FM_CELL_W);
+    return (c > 0) ? c : 1;
+}
+
+/* Верхний левый угол ЯЧЕЙКИ idx (не самой иконки), относительно тела
+ * окна — (0,0) это левый верхний угол области ПОД заголовком. */
+static void fm_cell_origin(int idx, uint32_t content_w, int32_t *cx, int32_t *cy) {
+    int cols = fm_cols(content_w);
+    int col = idx % cols;
+    int row = idx / cols;
+    *cx = FM_GRID_PAD + col * FM_CELL_W;
+    *cy = FM_GRID_PAD + row * FM_CELL_H;
+}
+
+static void fm_draw_entry_icon(fm_kind_t kind, int32_t x, int32_t y) {
+    png_image_t *img = NULL;
+    int loaded = 0;
+
+    switch (kind) {
+        case FM_KIND_DRIVE:
+            img = &g_fm_icon_disk;   loaded = g_fm_icon_disk_loaded;   break;
+        case FM_KIND_DIR:
+        case FM_KIND_UP:
+            img = &g_fm_icon_folder; loaded = g_fm_icon_folder_loaded; break;
+        case FM_KIND_FILE:
+        default:
+            img = &g_fm_icon_file;   loaded = g_fm_icon_file_loaded;   break;
+    }
+
+    if (loaded && img->pixels) {
+        fxapp_blit_png(x, y, img);
+    } else {
+        /* fallback, если соответствующий .png не найден на диске —
+         * разные цвета/подписи для disk/folder/file, чтобы смена вида
+         * (диск -> папка) была заметна визуально даже без иконок. */
+        fb_color_t bg;
+        const char *hint;
+        switch (kind) {
+            case FM_KIND_DRIVE: bg = 0xB0C4DEU; hint = "D"; break;  /* голубоватый — диск */
+            case FM_KIND_FILE:  bg = FB_LIGHT_GRAY; hint = "F"; break;
+            case FM_KIND_UP:    bg = 0xE8D080U; hint = "^"; break;  /* "вверх" — отдельный от папки */
+            case FM_KIND_DIR:
+            default:            bg = 0xE8D080U; hint = "/"; break; /* жёлтый — папка */
+        }
+        fb_fill_rect(x, y, FM_ICON_W, FM_ICON_H, bg);
+        fb_draw_rect(x, y, FM_ICON_W, FM_ICON_H, FB_DARK_GRAY, 1);
+        fb_draw_string(x + (int32_t)(FM_ICON_W / 2u) - 4, y + (int32_t)(FM_ICON_H / 2u) - 8,
+                       hint, FB_BLACK, bg);
+    }
+}
+
+/* Обрезать подпись до FM_LABEL_MAX_CH символов — под 32px иконкой в
+ * узкой сетке места на длинные имена нет. */
+static void fm_label_fit(const char *name, char *out, size_t out_sz) {
+    size_t n = strlen(name);
+    if (n >= out_sz) n = out_sz - 1;
+    for (size_t i = 0; i < n; i++) out[i] = name[i];
+    out[n] = '\0';
+    if (n >= FM_LABEL_MAX_CH && out_sz > FM_LABEL_MAX_CH) {
+        out[FM_LABEL_MAX_CH - 1] = '.';
+        out[FM_LABEL_MAX_CH] = '\0';
+    }
+}
+
+/* Нарисовать содержимое окна "My Computer": сетку иконок дисков/папок/
+ * файлов с подписями, либо "пусто", если смотреть не на что. Вызывается
+ * ПОСЛЕ ui_win_draw() (которое красит тело окна белым) — см. хуки в
+ * ui_win_create/ui_win_move_ex/ui_draw_desktop ниже. */
+static void fm_draw(int win_id) {
+    ui_window_t *win = &g_windows[win_id];
+    int32_t  base_x   = win->x;
+    int32_t  base_y   = win->y + (int32_t)UI_WIN_TITLEBAR_H;
+    uint32_t content_w = win->w;
+    uint32_t content_h = win->h - UI_WIN_TITLEBAR_H;
+
+    if (g_fm_entry_count == 0) {
+        const char *msg = (g_fm_view == FM_VIEW_DRIVES) ? "No disks" : "Folder is empty";
+        int32_t tw = (int32_t)fb_text_width(msg);
+        int32_t tx = base_x + (int32_t)((content_w - (uint32_t)(tw > 0 ? tw : 0)) / 2u);
+        int32_t ty = base_y + (int32_t)((content_h - FB_FONT_H) / 2u);
+        fb_draw_string(tx, ty, msg, FB_GRAY, FB_WHITE);
+        return;
+    }
+
+    for (int i = 0; i < g_fm_entry_count; i++) {
+        int32_t ox, oy;
+        fm_cell_origin(i, content_w, &ox, &oy);
+        if ((uint32_t)(oy + FM_CELL_H) > content_h) break;  /* дальше не влезает — без скролла */
+
+        int32_t icon_x = base_x + ox + (int32_t)((FM_CELL_W - (int32_t)FM_ICON_W) / 2);
+        int32_t icon_y = base_y + oy;
+        fm_draw_entry_icon(g_fm_entries[i].kind, icon_x, icon_y);
+
+        char label[FM_LABEL_MAX_CH + 1];
+        fm_label_fit(g_fm_entries[i].label, label, sizeof(label));
+        int32_t lw = (int32_t)fb_text_width(label);
+        int32_t label_x = base_x + ox + (int32_t)((FM_CELL_W - (uint32_t)(lw > 0 ? lw : 0)) / 2);
+        int32_t label_y = icon_y + (int32_t)FM_ICON_H + 4;
+        fb_draw_string(label_x, label_y, label, FB_BLACK, FB_WHITE);
+    }
+}
+
+/* Клик внутри тела окна "My Computer" (x,y — абсолютные экранные
+ * координаты). Определяет по сетке, в какую ячейку попал клик, и
+ * выполняет соответствующее действие (открыть диск/папку, подняться
+ * на уровень выше). Файлы пока некуда открывать — клик по ним
+ * ни на что не влияет, только просмотр списка. */
+static void fm_handle_click(int win_id, int32_t x, int32_t y) {
+    /* fm_reload_dir() делает блокирующий дисковый I/O (vfs_open/vfs_readdir
+     * читают сектора с virtio-blk). Пока он ждёт прерывания завершения,
+     * таймерный тик может повторно вызвать ui_desktop_handle_mouse() ДО
+     * того как первый вызов дописал/сбросил флаг "кнопка была нажата" —
+     * получится вложенный клик поверх ещё не завершённого fm_reload_dir,
+     * который затирает g_fm_entries на середине заполнения. g_fm_busy
+     * (общий на весь модуль, см. объявление у fm_reset) просто
+     * игнорирует такие вложенные клики. */
+    if (g_fm_busy) {
+        DBG_MSG("FXA", "my computer: click ignored (reentrant, I/O in progress)");
+        return;
+    }
+    g_fm_busy = true;
+    uint64_t fm_flags = fm_io_cli();
+
+    ui_window_t *win = &g_windows[win_id];
+
+    int32_t lx = x - win->x - FM_GRID_PAD;
+    int32_t ly = y - win->y - (int32_t)UI_WIN_TITLEBAR_H - FM_GRID_PAD;
+    bool handled = false;
+
+    if (lx >= 0 && ly >= 0) {
+        int cols = fm_cols(win->w);
+        int col = lx / FM_CELL_W;
+        int row = ly / FM_CELL_H;
+
+        if (col >= 0 && col < cols) {
+            int idx = row * cols + col;
+
+            if (idx >= 0 && idx < g_fm_entry_count) {
+                fm_entry_t *e = &g_fm_entries[idx];
+
+                switch (e->kind) {
+                    case FM_KIND_DRIVE:
+                        g_fm_view = FM_VIEW_DIR;
+                        strlcpy(g_fm_cur_path,   e->drive_path, sizeof(g_fm_cur_path));
+                        strlcpy(g_fm_drive_root, e->drive_path, sizeof(g_fm_drive_root));
+                        fm_reload_dir(g_fm_cur_path);
+                        handled = true;
+                        break;
+
+                    case FM_KIND_UP:
+                        if (strcmp(g_fm_cur_path, g_fm_drive_root) == 0) {
+                            /* уже в корне диска — дальше только к списку дисков */
+                            g_fm_view = FM_VIEW_DRIVES;
+                            fm_reload_drives();
+                        } else {
+                            fm_path_up(g_fm_cur_path);
+                            fm_reload_dir(g_fm_cur_path);
+                        }
+                        handled = true;
+                        break;
+
+                    case FM_KIND_DIR: {
+                        char child[FM_PATH_MAX];
+                        fm_path_join(g_fm_cur_path, e->label, child, sizeof(child));
+                        strlcpy(g_fm_cur_path, child, sizeof(g_fm_cur_path));
+                        fm_reload_dir(g_fm_cur_path);
+                        handled = true;
+                        break;
+                    }
+
+                    case FM_KIND_FILE:
+                    default:
+                        break;   /* нет реакции на клик по файлу */
+                }
+            }
+        }
+    }
+
+    if (handled) {
+        ui_win_draw(win_id);
+        fm_draw(win_id);
+        fb_flip();
+    }
+
+    fm_io_sti(fm_flags);
+    g_fm_busy = false;
+}
+
+/* =========================================================================
  * Генерический оконный менеджер — реализация.
  *
  * Один и тот же код обслуживает и встроенные окна ядра (My Computer —
@@ -1603,6 +2010,7 @@ static int ui_win_move_ex(int win_id, int32_t x, int32_t y, bool do_flip) {
     win->y = y;
     ui_win_save_bg(win_id, win->x, win->y);
     ui_win_draw(win_id);
+    if (win_id == g_fxapp_win_id) fm_draw(win_id);   /* ui_win_draw закрасило тело белым — перерисовываем сетку иконок */
     if (do_flip) fb_flip();
     return 0;
 }
@@ -1700,8 +2108,16 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
         }
 
         if (left_click && now_hover) {
-            if (g_fxapp_win_id < 0 || !g_windows[g_fxapp_win_id].used)
+            if (g_fxapp_win_id < 0 || !g_windows[g_fxapp_win_id].used) {
                 g_fxapp_win_id = ui_win_create(g_fxapp_title, FXAPP_WIN_W, FXAPP_WIN_H, -1);
+                if (g_fxapp_win_id >= 0) {
+                    /* Каждое открытие — заново с списка дисков (см. блок
+                     * "My Computer" — содержимое окна выше). */
+                    fm_reset();
+                    fm_draw(g_fxapp_win_id);
+                    fb_flip();
+                }
+            }
         }
     }
 
@@ -1719,6 +2135,15 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
             ui_win_close(i);
             if (i == g_fxapp_win_id) g_fxapp_win_id = -1;
             continue;
+        }
+
+        /* Клик по телу окна "My Computer" (не по заголовку/крестику) —
+         * навигация по дискам/папкам, см. fm_handle_click выше. */
+        if (i == g_fxapp_win_id && left_click &&
+            y >= win->y + (int32_t)UI_WIN_TITLEBAR_H &&
+            point_in_rect(x, y, win->x, win->y, win->w, win->h)) {
+            DBG_MSG("FXA", "my computer: content click gate fired");
+            fm_handle_click(i, x, y);
         }
 
         if (left_click && point_in_rect(x, y, win->x, win->y, win->w, UI_WIN_TITLEBAR_H)) {
@@ -1846,6 +2271,7 @@ void ui_draw_desktop(void) {
         if (g_windows[i].used && g_windows[i].open) {
             ui_win_save_bg(i, g_windows[i].x, g_windows[i].y);
             ui_win_draw(i);
+            if (i == g_fxapp_win_id) fm_draw(i);
         }
     }
 

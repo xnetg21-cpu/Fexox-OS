@@ -230,6 +230,16 @@ int  vfs_mount(const char *dev_name, const char *fs_name,
 /* Размонтирование */
 int  vfs_umount(const char *path);
 
+/* Перечисление точек монтирования — для UI ("Мой компьютер" и т.п.),
+ * не часть POSIX-подобного API выше.
+ *   vfs_mount_count — сколько дисков сейчас смонтировано.
+ *   vfs_mount_info  — путь монтирования и имя блочного устройства
+ *                     ("vda" и т.п.) для диска idx (0..count-1).
+ *                     Возвращает false если idx вне диапазона. */
+int  vfs_mount_count(void);
+bool vfs_mount_info(int idx, char *path_out, size_t path_sz,
+                    char *dev_out, size_t dev_sz);
+
 /* --- Работа с файлами --- */
 
 /* Открыть файл/директорию. Возвращает fd >= 0 или < 0 при ошибке. */
