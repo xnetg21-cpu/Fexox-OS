@@ -825,9 +825,9 @@ static void ui_system_reboot(void);
 #define FXAPP_ICON_FILE_MAXSZ  (256u * 1024u)
 
 #define FXAPP_WIN_CLOSE_SZ     20u    /* размер close.png — общий для всех окон */
-#define FXAPP_WIN_W           320u    /* размер окна "My Computer" — увеличено под
-                                        * сетку иконок дисков/папок/файлов (см. ниже) */
-#define FXAPP_WIN_H           280u    /* включая заголовок */
+#define FXAPP_WIN_W           420u    /* размер окна "My Computer" — увеличено под
+                                        * сетку иконок дисков/папок/файлов 64x64 (см. ниже) */
+#define FXAPP_WIN_H           360u    /* включая заголовок */
 /* Остальная геометрия/цвета окна теперь общие для ВСЕХ окон —
  * см. UI_WIN_TITLEBAR_H / UI_WIN_CLOSE_SZ / UI_WIN_*_BG в блоке
  * генерического оконного менеджера ниже. */
@@ -1383,6 +1383,23 @@ static void fxapp_draw_icon(bool hovered) {
         fb_draw_string(icx + 20, icy + (int32_t)(FXAPP_ICON_H / 2u) - 8,
                        "PC", FB_BLACK, FB_LIGHT_GRAY);
     }
+
+    /* Подпись под иконкой (как под disk.png/folder.png/file.png в самом
+     * окне "My Computer" — см. fm_draw), тем же именем, что и в шапке
+     * окна (g_fxapp_title, по умолчанию "My Computer" или из манифеста
+     * APPS/MyComputer.fxapp). Рисуем поверх WALLPAPER_COLOR/обоев —
+     * fxapp_capture_icon_bg() уже захватил фон под халом иконки ДО этой
+     * подписи, так что при повторной перерисовке (hover) текст тоже
+     * корректно восстановится вместе с остальным захваченным фоном
+     * только если попадает в захваченную область — halo сверху покрывает
+     * иконку с запасом FXAPP_ICON_HALO_PAD, а подпись ниже иконки в эту
+     * область не входит, поэтому просто перерисовываем её каждый раз. */
+    {
+        int32_t lw = (int32_t)fb_text_width(g_fxapp_title);
+        int32_t lx = icx + (int32_t)((FXAPP_ICON_W - (uint32_t)(lw > 0 ? lw : 0)) / 2);
+        int32_t ly = icy + (int32_t)FXAPP_ICON_H + FXAPP_ICON_HALO_PAD + 4;
+        fb_draw_string(lx, ly, g_fxapp_title, FB_WHITE, FB_TRANSPARENT_BG);
+    }
 }
 
 /* =========================================================================
@@ -1395,14 +1412,14 @@ static void fxapp_draw_icon(bool hovered) {
  * а с корня диска возвращает к списку дисков. Если смотреть не на что —
  * рисуется надпись (шрифт без кириллицы, поэтому по-английски).
  * ========================================================================= */
-#define FM_ICON_W        32u
-#define FM_ICON_H        32u
-#define FM_CELL_W          72   /* ширина ячейки сетки (иконка + отступы) */
-#define FM_CELL_H          56   /* высота ячейки (иконка 32 + зазор + подпись) */
+#define FM_ICON_W        64u
+#define FM_ICON_H        64u
+#define FM_CELL_W          96   /* ширина ячейки сетки (иконка 64 + отступы) */
+#define FM_CELL_H          96   /* высота ячейки (иконка 64 + зазор + подпись) */
 #define FM_GRID_PAD          8  /* отступ сетки от краёв тела окна */
 #define FM_PATH_MAX        256
 #define FM_MAX_ENTRIES      32  /* больше и не влезет в окно без скролла */
-#define FM_LABEL_MAX_CH      8  /* символов имени под иконкой (шрифт 8px/симв) */
+#define FM_LABEL_MAX_CH     11  /* символов имени под иконкой (шрифт 8px/симв, ячейка 96px) */
 
 typedef enum {
     FM_KIND_DRIVE = 0,   /* точка монтирования — диск */
@@ -2257,6 +2274,12 @@ void ui_draw_desktop(void) {
     ui_draw_menu_button((int32_t)panel_y);
     ui_draw_taskbar_clock((int32_t)panel_y);
     ui_taskbar_draw_app_buttons((int32_t)panel_y);
+
+    /* Подпись рабочего стола в левом верхнем углу — поверх обоев,
+     * прозрачный фон (см. FB_TRANSPARENT_BG в fb_draw_char), чтобы не
+     * закрывать обои непрозрачным прямоугольником. */
+    fb_draw_string(FXAPP_ICON_MARGIN, FXAPP_ICON_MARGIN,
+                   "FEXOX OS Desktop", FB_WHITE, FB_TRANSPARENT_BG);
 
     /* fxapp: иконка "My Computer" — грузим ассеты один раз, захватываем
      * чистый фон под ней (для дешёвой перерисовки при hover) и рисуем. */
